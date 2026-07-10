@@ -38,8 +38,10 @@ def _load_prefs() -> dict:
 
 
 def _save_prefs(d: dict) -> None:
+    prefs = _load_prefs()
+    prefs.update(d)
     PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PREFS_PATH.write_text(json.dumps(d, indent=2))
+    PREFS_PATH.write_text(json.dumps(prefs, indent=2))
 
 
 # ── Session state init ───────────────────────────────────────────────────────
@@ -296,8 +298,37 @@ def _page_scanner(
                 "day_high", "day_low", "or_high", "or_low",
                 "market_phase", "signal_reason", "as_of",
             ]
-            display = filtered[[c for c in display_cols if c in filtered.columns]].copy()
-            display["trade_signal"] = display["trade_signal"].apply(_signal_badge)
+            available_cols = [c for c in display_cols if c in filtered.columns]
+
+            # User-defined column order, persisted across sessions
+            saved_order = _load_prefs().get("results_column_order") or available_cols
+            saved_order = [c for c in saved_order if c in available_cols] or available_cols
+
+            def _reset_column_order():
+                st.session_state.results_col_order = available_cols
+
+            with st.expander("⚙️ Arrange Columns"):
+                st.caption(
+                    "Columns display in the order you select them — remove one to hide it, "
+                    "re-add it to move it to the end. Your arrangement is saved between sessions."
+                )
+                ordered_cols = st.multiselect(
+                    "Visible columns (selection order = display order)",
+                    options=available_cols,
+                    default=saved_order,
+                    key="results_col_order",
+                )
+                st.button("Reset to default order", on_click=_reset_column_order)
+
+            if not ordered_cols:
+                ordered_cols = available_cols
+            if ordered_cols != saved_order:
+                _save_prefs({"results_column_order": ordered_cols})
+
+            data = filtered.reset_index(drop=True)
+            display = data[ordered_cols].copy()
+            if "trade_signal" in display.columns:
+                display["trade_signal"] = display["trade_signal"].apply(_signal_badge)
 
             def _fmt2(x):
                 try:
@@ -321,16 +352,59 @@ def _page_scanner(
             if "avg_dollar_volume" in display.columns:
                 fmt_map["avg_dollar_volume"] = _fmt_mm
 
-            def _highlight_key_level(row):
-                if row.get("at_key_level"):
+            # Selection made on the previous rerun — used to paint the full row
+            selected_set: set = set()
+            grid_state = st.session_state.get("results_grid")
+            if grid_state:
+                selected_set = {
+                    r for r in grid_state.get("selection", {}).get("rows", [])
+                    if r < len(display)
+                }
+
+            # Key-level flags come from the full data so the highlight survives
+            # even when the at_key_level column itself is hidden by the user.
+            key_flags = data["at_key_level"] if "at_key_level" in data.columns else None
+
+            def _style_row(row):
+                if row.name in selected_set:
+                    return ["background-color: #cce0ff; color: #000000; font-weight: 600"] * len(row)
+                flag = key_flags.iloc[row.name] if key_flags is not None else None
+                if pd.notna(flag) and flag:
                     return ["background-color: #fff3b0; color: #000000"] * len(row)
                 return [""] * len(row)
 
-            styled = display.style.format(fmt_map, na_rep="")
-            if "at_key_level" in display.columns:
-                styled = styled.apply(_highlight_key_level, axis=1)
+            styled = display.style.format(fmt_map, na_rep="").apply(_style_row, axis=1)
 
-            st.dataframe(styled, use_container_width=True, hide_index=True)
+            event = st.dataframe(
+                styled,
+                use_container_width=True,
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="results_grid",
+            )
+
+            sel_rows = [r for r in (event.selection.rows if event else []) if r < len(data)]
+            if sel_rows:
+                sel = data.iloc[sel_rows[0]]
+
+                def _num(v):
+                    try:
+                        return f"{float(v):.2f}"
+                    except (TypeError, ValueError):
+                        return "—"
+
+                st.markdown(f"**Selected:** {_signal_badge(sel.get('trade_signal', ''))} — **{sel.get('ticker', '')}**")
+                d1, d2, d3, d4, d5 = st.columns(5)
+                d1.metric("Last", _num(sel.get("last")))
+                d2.metric("Entry", _num(sel.get("suggested_entry")))
+                d3.metric("Stop", _num(sel.get("suggested_stop")))
+                d4.metric("Target", _num(sel.get("suggested_target")))
+                d5.metric("R:R", _num(sel.get("rr_ratio")))
+                if sel.get("signal_reason"):
+                    st.caption(sel["signal_reason"])
+            else:
+                st.caption("Select a row (checkbox on the left) to highlight it and see its trade levels.")
 
             with st.expander("Column Guide"):
                 st.markdown("""
@@ -344,7 +418,7 @@ def _page_scanner(
 | breakout_score | Day/opening-range breakout + liquidity window component (0–20) |
 | last / day_change_pct | Last completed 5m close; change vs previous session close |
 | rs_vs_spy / rs_assessment | Day change minus SPY's: OUTPERFORMING / IN_LINE / UNDERPERFORMING (±1%) |
-| suggested_entry / stop / target | ATR-based levels (stop 1.5×ATR floor 0.30%, target 1.5R) |
+| suggested_entry / stop / target | ATR-based levels (stop 2.5×ATR floor 0.50%, target 1.5R) |
 | stop_dollars / target_dollars / stop_pct | Risk and reward in $ per share; stop as % of entry |
 | mtf_score / mtf_confluence | Multi-timeframe agreement: 5m + hourly + daily (0/15/30) |
 | hourly_direction / daily_direction | Higher-timeframe trend (LONG/SHORT/NEUTRAL) |
@@ -578,7 +652,20 @@ def _page_live_quotes(storage: Storage, selected_tickers: list, allow_offhours: 
     else:
         qdf = pd.DataFrame(quotes)
 
+        display_cols = ["ticker", "last", "prev_close", "change_pct", "volume", "as_of"]
+        display = qdf[[c for c in display_cols if c in qdf.columns]].reset_index(drop=True)
+
+        selected_set: set = set()
+        quotes_state = st.session_state.get("quotes_grid")
+        if quotes_state:
+            selected_set = {
+                r for r in quotes_state.get("selection", {}).get("rows", [])
+                if r < len(display)
+            }
+
         def _row_color(row):
+            if row.name in selected_set:
+                return ["background-color: #cce0ff; color: #000000; font-weight: 600"] * len(row)
             try:
                 chg = float(row.get("change_pct") or 0)
             except (TypeError, ValueError):
@@ -589,8 +676,6 @@ def _page_live_quotes(storage: Storage, selected_tickers: list, allow_offhours: 
                 return ["background-color: #f3d8d8; color: #000000"] * len(row)
             return [""] * len(row)
 
-        display_cols = ["ticker", "last", "prev_close", "change_pct", "volume", "as_of"]
-        display = qdf[[c for c in display_cols if c in qdf.columns]]
         fmt = {c: "{:.2f}" for c in ["last", "prev_close"] if c in display.columns}
         if "change_pct" in display.columns:
             fmt["change_pct"] = "{:+.2f}%"
@@ -600,6 +685,9 @@ def _page_live_quotes(storage: Storage, selected_tickers: list, allow_offhours: 
             display.style.apply(_row_color, axis=1).format(fmt, na_rep=""),
             use_container_width=True,
             hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="quotes_grid",
         )
 
         st.caption(

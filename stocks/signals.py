@@ -165,13 +165,15 @@ def _day_breakout(
     reasons = []
     direction = "NEUTRAL"
 
-    # Liquidity-window bonus (max 10 pts)
+    # Liquidity-window bonus (max 10 pts). Forward-testing showed the first hour
+    # was the worst entry window (27% win rate, −0.33R/trade): the old +10
+    # near-open bonus pushed marginal setups over the actionable threshold right
+    # into opening chop. Only the closing hour keeps the full bonus now.
     if phase == "REGULAR":
-        near_open = minutes_since_open is not None and minutes_since_open <= 60
         near_close = minutes_to_close is not None and minutes_to_close <= 60
-        if near_open or near_close:
+        if near_close:
             score += 10
-            reasons.append("Open/close high-volume window")
+            reasons.append("Closing high-volume window")
         else:
             score += 5
             reasons.append("Regular session active")
@@ -295,11 +297,19 @@ _ADX_RANGE = 18.0
 
 # ATR multiples for suggested stop/target. Reward:risk stays fixed — the target is
 # derived from the final stop distance, so widening the stop widens the target too.
-_STOP_ATR_MULT = 1.5
+# Forward-testing at 1.5×ATR / 0.30% floor put the median stop at 0.52% of price:
+# 54% of trades stopped out (median 48 min), i.e. the stop sat inside ordinary
+# 5m-bar noise. Widened to keep the stop outside one bar's wiggle.
+_STOP_ATR_MULT = 2.5
 _RR = 1.5
-# Noise floor for the stop: 1×ATR on 5m bars can be a few cents, inside ordinary
-# bid/ask noise. Never risk less than 0.30% of the entry price.
-_MIN_STOP_PCT = 0.003
+# Noise floor for the stop: never risk less than 0.50% of the entry price.
+_MIN_STOP_PCT = 0.005
+
+# Over-extension gate: STRONG signals fire when momentum + breakout + MTF all
+# align — i.e. late in a move. Forward-tested STRONG_BUYs stopped out in a median
+# of 18 minutes (buying the local extreme). Beyond this many ATRs from EMA20 the
+# signal downgrades to WATCH_ONLY until price pulls back.
+_MAX_EXTENSION_ATR = 2.0
 
 # Forward-testing a target under this % of entry is untradeable noise after
 # commissions/slippage (replaces the forex 3×spread thin-edge gate).
@@ -472,6 +482,20 @@ def score_ticker(
     else:
         trade_signal = "AVOID"
         reason = f"No clear setup ({total:.0f}pts)"
+
+    # Over-extension gate (see _MAX_EXTENSION_ATR): don't chase a STRONG signal
+    # that is already stretched far from its EMA20.
+    if (
+        trade_signal in ("STRONG_BUY", "STRONG_SHORT")
+        and close is not None and ema20 is not None and atr14
+    ):
+        extension = (close - ema20) / atr14
+        if trade_signal == "STRONG_BUY" and extension > _MAX_EXTENSION_ATR:
+            trade_signal = "WATCH_ONLY"
+            reason = f"Extended {extension:.1f}×ATR above EMA20 — wait for pullback"
+        elif trade_signal == "STRONG_SHORT" and extension < -_MAX_EXTENSION_ATR:
+            trade_signal = "WATCH_ONLY"
+            reason = f"Extended {abs(extension):.1f}×ATR below EMA20 — wait for pullback"
 
     # ATR-based stop/target/RR for actionable directions. Entry is the last completed
     # 5m close (yfinance has no bid/ask).

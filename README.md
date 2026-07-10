@@ -8,13 +8,15 @@ A near-real-time US stock screening dashboard built with Streamlit and free Yaho
 - **Signals**: 🟢 STRONG_BUY · 🔵 BUY_CANDIDATE · 🟠 SHORT_CANDIDATE · 🔴 STRONG_SHORT · 🟡 WATCH_ONLY · ⚫ AVOID
 - **Scoring engine** (per ticker, on completed 5-minute bars):
   - Momentum (EMA9/20, MACD, RSI) and mean reversion (RSI extremes, Bollinger Bands, day-range position), blended by an ADX regime gate (trend vs range)
-  - Opening-range / day high-low breakout with a first/last-hour liquidity bonus
+  - Opening-range / day high-low breakout with a last-hour liquidity bonus
   - Multi-timeframe confluence across 5m / hourly / daily trends
   - Support/resistance proximity from daily + hourly pivot levels
   - Relative strength vs SPY (outperformers get a long bonus, underperformers a short bonus)
   - Average-dollar-volume liquidity gate
-- **Trade levels**: ATR-based stop (1.5×ATR, floor 0.30% of price) and 1.5R target, in dollars per share
+- **Trade levels**: ATR-based stop (2.5×ATR, floor 0.50% of price) and 1.5R target, in dollars per share
 - **Self-calibrating performance tracking**: each scan checks open tracked signals against fresh bars; stop/target touches record WIN/LOSS outcomes feeding win-rate, expectancy, and equity-curve stats
+- **Calibration-driven guards** (from forward-test results): signals in the first hour after the open display but are not forward-tested as trades, and a STRONG signal stretched more than 2×ATR from its EMA20 downgrades to WATCH_ONLY instead of chasing
+- **Interactive results grid**: click a row to highlight it end-to-end and see its entry/stop/target/R:R at a glance; arrange/hide columns in any order you like (saved between sessions, "Reset to default" one click away)
 - **Market-hours aware**: phase badge (pre-market / regular / after-hours / closed); auto-refresh pauses off-hours unless overridden; manual scans always work against the last session's bars
 - **Efficient fetching**: 3 batched yfinance requests per scan regardless of watchlist size, with TTL caches on hourly/daily frames; the still-forming candle is dropped so signals never repaint
 

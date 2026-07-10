@@ -26,6 +26,10 @@ from .relative_strength import calculate_rs, rs_assessment, rs_bonus
 # Reused across scans within one Streamlit session so the 1h/1d TTL caches survive.
 _shared_client = YFClient()
 
+# Minutes after the 09:30 open during which actionable signals are NOT armed for
+# forward-testing (they still display in the grid). See run_scan for rationale.
+OPEN_CHOP_MINUTES = 60
+
 
 def _prev_session_close(d1_dicts: List[dict], as_of: str) -> Optional[float]:
     """Previous session's daily close relative to ``as_of`` (skips the daily bar of
@@ -233,6 +237,15 @@ def run_scan(
     # Forward-evaluate previously-tracked signals against this scan's fresh bars,
     # then arm any new actionable signals.
     _ACTIONABLE = ("STRONG_BUY", "BUY_CANDIDATE", "STRONG_SHORT", "SHORT_CANDIDATE")
+    # First-hour arming gate: forward-testing showed entries armed in the opening
+    # hour were the biggest loss bucket (27% win rate, −0.33R/trade — removing them
+    # flips the whole system positive). Signals still display; they just aren't
+    # forward-tested as trades until the open chop settles.
+    opening_chop = (
+        phase == "REGULAR"
+        and mins_open is not None
+        and mins_open < OPEN_CHOP_MINUTES
+    )
     for s in snapshots:
         ticker_bars = bars_by_ticker.get(s.ticker) or []
         if ticker_bars:
@@ -254,6 +267,7 @@ def run_scan(
             and s.suggested_target is not None
             and ticker_bars
             and not thin_edge
+            and not opening_chop
         ):
             direction = -1 if "SHORT" in s.trade_signal else 1
             try:
