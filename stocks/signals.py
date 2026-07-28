@@ -222,27 +222,35 @@ def _day_breakout(
 
 
 def _mtf_confluence(
-    m5_dir: Optional[str],
+    dominant: Optional[str],
     hourly_dir: Optional[str],
     daily_dir: Optional[str],
 ) -> Tuple[float, str]:
     """
-    Score multi-timeframe alignment.
-    Full (all 3 agree): +30 pts, "FULL"
-    Two of three agree: +15 pts, "PARTIAL"
-    Conflict/missing: 0 pts, "NONE"
+    Score higher-timeframe confirmation of the 5m ``dominant`` direction.
+
+    The 5m direction is the thing being confirmed — it is NOT a vote. It used to be
+    passed in as one of three votes, so a setup whose hourly and daily reads were
+    both NEUTRAL scored "FULL" (+30 pts) purely on its own say-so. Those 30 free
+    points are most of what let a mediocre setup clear the 70-point STRONG
+    threshold, which is why the STRONG tier never outperformed. (The identical bug
+    was measured in the forex sibling: 103 of 143 FULL rows had a NEUTRAL/absent
+    higher timeframe, and 20 had *both* neutral.)
+
+    FULL now requires both the hourly and the daily trend present and agreeing.
     """
-    dirs = [d for d in (m5_dir, hourly_dir, daily_dir) if d and d != "NEUTRAL"]
-    if not dirs:
+    if dominant not in ("LONG", "SHORT"):
         return 0.0, "NONE"
-    long_count = dirs.count("LONG")
-    short_count = dirs.count("SHORT")
-    total = len(dirs)
-    if long_count == total or short_count == total:
-        return 30.0, "FULL"
-    elif long_count >= 2 or short_count >= 2:
-        return 15.0, "PARTIAL"
-    return 0.0, "NONE"
+
+    votes = [d for d in (hourly_dir, daily_dir) if d in ("LONG", "SHORT")]
+    if not votes:
+        return 0.0, "UNCONFIRMED"
+
+    agree = sum(1 for v in votes if v == dominant)
+    oppose = len(votes) - agree
+    if oppose:
+        return 0.0, "OPPOSED" if agree == 0 else "CONFLICT"
+    return (30.0, "FULL") if len(votes) == 2 else (15.0, "PARTIAL")
 
 
 def _sr_proximity(
@@ -250,13 +258,24 @@ def _sr_proximity(
     atr14: Optional[float],
     sr_levels: list,
     dominant_direction: str,
-) -> Tuple[float, str, bool, Optional[float], Optional[float]]:
+) -> Tuple[float, str, bool, bool, Optional[float], Optional[float]]:
     """
-    Score proximity to key S/R levels.
-    Returns (score, reason, at_key_level, nearest_support, nearest_resistance).
+    Score structure *relative to the trade direction*.
+
+    A level only helps when it sits **behind** the trade (support beneath a long,
+    resistance above a short) — that is where the stop shelters. A level directly
+    **ahead** is a wall: it caps the move before the target can be reached.
+
+    The previous version was direction-blind — both the `dist <= 0.3` branches
+    awarded +25 and set at_key_level regardless of which way the trade pointed, so
+    a long pinned under resistance scored identically to a long bouncing off
+    support. Combined with the MTF bug this manufactured the STRONG tier.
+
+    Returns (score, reason, at_key_level, blocked_ahead, nearest_support, nearest_resistance).
+    ``score`` may be negative when structure opposes the trade.
     """
-    if not sr_levels or not close or not atr14 or atr14 == 0:
-        return 0.0, "", False, None, None
+    if not sr_levels or not close or not atr14 or atr14 <= 0:
+        return 0.0, "", False, False, None, None
 
     supports = [lv["price"] for lv in sr_levels if lv["type"] == "S" and lv["price"] <= close]
     resistances = [lv["price"] for lv in sr_levels if lv["type"] == "R" and lv["price"] >= close]
@@ -264,31 +283,51 @@ def _sr_proximity(
     nearest_support = max(supports) if supports else None
     nearest_resistance = min(resistances) if resistances else None
 
+    if dominant_direction not in ("LONG", "SHORT"):
+        return 0.0, "", False, False, nearest_support, nearest_resistance
+
+    if dominant_direction == "LONG":
+        behind, ahead = nearest_support, nearest_resistance
+        behind_label, ahead_label = "support", "resistance"
+    else:
+        behind, ahead = nearest_resistance, nearest_support
+        behind_label, ahead_label = "resistance", "support"
+
     score = 0.0
     reasons: List[str] = []
     at_key_level = False
+    blocked_ahead = False
 
-    if nearest_support is not None:
-        dist = (close - nearest_support) / atr14
+    if behind is not None:
+        dist = abs(close - behind) / atr14
         if dist <= 0.3:
             score += 25
             at_key_level = True
-            reasons.append(f"AT support {nearest_support:.2f}")
-        elif dist <= 1.0 and dominant_direction == "LONG":
+            reasons.append(f"AT {behind_label} {behind:.2f} (entry at structure)")
+        elif dist <= 1.0:
             score += 15
-            reasons.append(f"Near support {nearest_support:.2f}")
+            reasons.append(f"Near {behind_label} {behind:.2f}")
 
-    if nearest_resistance is not None:
-        dist = (nearest_resistance - close) / atr14
-        if dist <= 0.3:
-            score += 25
-            at_key_level = True
-            reasons.append(f"AT resistance {nearest_resistance:.2f}")
-        elif dist <= 1.0 and dominant_direction == "SHORT":
-            score += 15
-            reasons.append(f"Near resistance {nearest_resistance:.2f}")
+    if ahead is not None:
+        dist = abs(ahead - close) / atr14
+        # Target sits ~3.75×ATR out (1.5×RR on a 2.5×ATR stop), so a level inside
+        # 1.5×ATR means the trade is very unlikely to reach target unimpeded.
+        if dist <= 1.5:
+            score -= 25
+            blocked_ahead = True
+            reasons.append(f"BLOCKED by {ahead_label} {ahead:.2f} ({dist:.1f}×ATR ahead)")
+        elif dist <= 2.5:
+            score -= 10
+            reasons.append(f"{ahead_label.capitalize()} {ahead:.2f} close ahead ({dist:.1f}×ATR)")
 
-    return round(min(score, 25), 1), "; ".join(reasons), at_key_level, nearest_support, nearest_resistance
+    return (
+        round(max(-25.0, min(score, 25.0)), 1),
+        "; ".join(reasons),
+        at_key_level,
+        blocked_ahead,
+        nearest_support,
+        nearest_resistance,
+    )
 
 
 # Regime thresholds on ADX: above TREND → momentum playbook, below RANGE → reversion.
@@ -314,6 +353,58 @@ _MAX_EXTENSION_ATR = 2.0
 # Forward-testing a target under this % of entry is untradeable noise after
 # commissions/slippage (replaces the forex 3×spread thin-edge gate).
 MIN_TARGET_PCT = 0.15
+
+# ── Transaction cost ────────────────────────────────────────────────────────
+# yfinance returns last-trade prices with no bid/ask, so unlike the forex sibling
+# the round-trip cost cannot be observed — it has to be estimated. Liquidity is by
+# far the strongest determinant of effective spread, so cost is tiered on 20-day
+# average dollar volume. Figures are round-trip basis points of price and are
+# deliberately conservative: understating cost is what makes a backtest lie.
+_COST_TIERS_BPS = (
+    (50_000_000.0, 3.0),    # mega/large cap: ~1c on a $100 name, both sides
+    (10_000_000.0, 8.0),
+    (2_000_000.0, 20.0),
+)
+_COST_BPS_THIN = 50.0       # below $2M/day the spread alone eats a third of a 1.5R target
+
+# Hard veto: above this fraction of risk, cost dominates any plausible edge in the
+# score. At a 0.6% stop this vetoes anything costing more than ~9bps round trip,
+# i.e. roughly the sub-$10M-ADV tier.
+_MAX_COST_RATIO = 0.15
+
+# How far above cost-adjusted breakeven a modelled probability must sit before the
+# trade is worth taking. Trading at exactly breakeven just donates the spread to
+# the market maker while adding variance, so demand a real cushion.
+_PROB_MARGIN = 0.04
+
+
+def estimate_cost_pct(avg_dollar_volume: Optional[float]) -> float:
+    """
+    Estimated round-trip transaction cost as a percentage of price.
+
+    Returns the most pessimistic tier when liquidity is unknown — an unmeasured
+    cost is not a zero cost, and treating it as one is how a screener talks itself
+    into illiquid names.
+    """
+    if avg_dollar_volume is None or avg_dollar_volume <= 0:
+        return _COST_BPS_THIN / 100.0
+    for floor, bps in _COST_TIERS_BPS:
+        if avg_dollar_volume >= floor:
+            return bps / 100.0
+    return _COST_BPS_THIN / 100.0
+
+
+def breakeven_win_rate(rr: float = _RR, cost_ratio: float = 0.0) -> float:
+    """
+    Win rate at which a bracket exactly breaks even, including round-trip cost.
+
+    expectancy = p·(rr − c) − (1 − p)·(1 + c) = 0  ⇒  p = (1 + c) / (1 + rr)
+
+    with everything expressed in units of the stop distance. At rr=1.5 and zero
+    cost this is exactly 0.400 — which is why an edgeless system lands on ~40%,
+    and why a measured 40% win rate is indistinguishable from random entry.
+    """
+    return (1.0 + cost_ratio) / (1.0 + rr)
 
 
 def _regime_weights(adx14: Optional[float]) -> Tuple[float, float, str]:
@@ -372,10 +463,21 @@ def score_ticker(
     hourly_direction: Optional[str] = None,
     daily_direction: Optional[str] = None,
     sr_levels: Optional[list] = None,
+    model_prob: Optional[float] = None,
+    strength_bonus: float = 0.0,
 ) -> dict:
     """
     Compute all signal scores and produce final trade_signal.
     Returns a dict merging into StockSnapshot.
+
+    ``model_prob`` is the trained model's P(target before stop) for this setup, when
+    one is available. It acts as a veto, never as a promoter: the rule-based score
+    still has to propose the setup, and the model decides whether the measured odds
+    justify paying the cost of the round trip.
+
+    ``strength_bonus`` is the relative-strength-vs-SPY adjustment. It is passed in
+    rather than applied afterwards so that the score driving the decision, the score
+    shown on the dashboard, and the score the model trains on are the same number.
     """
     close = indicators.get("close")
     rsi14 = indicators.get("rsi14")
@@ -435,21 +537,41 @@ def score_ticker(
         "SHORT" if short_w > long_w else "NEUTRAL"
     )
 
-    # MTF confluence bonus (0-30 pts)
+    # MTF confluence bonus (0-30 pts) — requires real higher-timeframe confirmation
     mtf_bonus, mtf_confluence = _mtf_confluence(dominant, hourly_direction, daily_direction)
 
-    # S/R proximity bonus (0-25 pts)
-    sr_bonus, sr_reason, at_key_level, nearest_support, nearest_resistance = _sr_proximity(
-        close, atr14, sr_levels or [], dominant
-    )
+    # S/R structure, direction-aware (-25 to +25 pts)
+    (
+        sr_bonus, sr_reason, at_key_level, blocked_ahead,
+        nearest_support, nearest_resistance,
+    ) = _sr_proximity(close, atr14, sr_levels or [], dominant)
 
-    total = mom_score + rev_score + brk_score + mtf_bonus + sr_bonus
+    total = mom_score + rev_score + brk_score + mtf_bonus + sr_bonus + strength_bonus
 
     # Penalize thin liquidity
     if thin_liquidity:
         total = max(0, total - 20)
 
-    # Hourly alignment gate: forex forward-testing showed candidates firing against
+    # Cost ratio: estimated round-trip cost as a fraction of the risk being taken.
+    # Computed from the stop we would actually use, so it reflects the real drag on
+    # expectancy rather than an abstract bps number.
+    entry_px = last or close
+    provisional = _trade_levels(dominant, entry_px, atr14)
+    prov_stop_pct = provisional.get("stop_pct") or 0.0
+    cost_pct = estimate_cost_pct(avg_dollar_volume)
+    cost_ratio = round(cost_pct / prov_stop_pct, 4) if prov_stop_pct > 0 else None
+    cost_veto = cost_ratio is not None and cost_ratio > _MAX_COST_RATIO
+    if cost_veto:
+        risk_notes.append(
+            f"Cost {cost_ratio:.0%} of risk (est. {cost_pct:.2f}% round trip vs "
+            f"{prov_stop_pct:.2f}% stop) — above {_MAX_COST_RATIO:.0%} limit"
+        )
+
+    ahead_block_label = "resistance" if dominant == "LONG" else "support"
+    if blocked_ahead:
+        risk_notes.append(f"Nearby {ahead_block_label} blocks the path to target")
+
+    # Hourly alignment gate: forward-testing showed candidates firing against
     # the next timeframe up were the biggest loss bucket. An actionable signal must
     # not fight the hourly trend.
     hourly_opposes = (
@@ -458,12 +580,31 @@ def score_ticker(
         and hourly_direction != dominant
     )
 
+    # Probability gate. When a trained model is available, an actionable signal must
+    # clear the cost-adjusted breakeven win rate by a margin — this is the whole
+    # point of the learning loop: the score proposes, the measured model disposes.
+    be_p = breakeven_win_rate(_RR, cost_ratio or 0.0)
+    required_p = round(be_p + _PROB_MARGIN, 4)
+    prob_veto = model_prob is not None and model_prob < required_p
+
     if illiquid:
         trade_signal = "AVOID"
         reason = f"Too illiquid (avg ${(avg_dollar_volume or 0):,.0f}/day)"
+    elif cost_veto:
+        trade_signal = "AVOID"
+        reason = f"Est. cost {cost_ratio:.0%} of risk exceeds {_MAX_COST_RATIO:.0%} limit"
     elif hourly_opposes and total >= 45:
         trade_signal = "WATCH_ONLY"
         reason = f"{dominant} setup ({total:.0f}pts) but hourly trend is {hourly_direction} — countertrend"
+    elif blocked_ahead and total >= 45:
+        trade_signal = "WATCH_ONLY"
+        reason = f"{dominant} setup ({total:.0f}pts) but {ahead_block_label} blocks the target"
+    elif prob_veto and total >= 45:
+        trade_signal = "WATCH_ONLY"
+        reason = (
+            f"{dominant} setup ({total:.0f}pts) but model P(win)={model_prob:.0%} "
+            f"< {required_p:.0%} required"
+        )
     elif total >= 70 and dominant == "LONG" and mtf_bonus >= 15:
         trade_signal = "STRONG_BUY"
         reason = f"Strong long setup ({total:.0f}pts, MTF:{mtf_confluence})"
@@ -485,24 +626,23 @@ def score_ticker(
 
     # Over-extension gate (see _MAX_EXTENSION_ATR): don't chase a STRONG signal
     # that is already stretched far from its EMA20.
-    if (
-        trade_signal in ("STRONG_BUY", "STRONG_SHORT")
-        and close is not None and ema20 is not None and atr14
-    ):
-        extension = (close - ema20) / atr14
-        if trade_signal == "STRONG_BUY" and extension > _MAX_EXTENSION_ATR:
+    extension_atr: Optional[float] = None
+    if close is not None and ema20 is not None and atr14:
+        extension_atr = round((close - ema20) / atr14, 2)
+    if trade_signal in ("STRONG_BUY", "STRONG_SHORT") and extension_atr is not None:
+        if trade_signal == "STRONG_BUY" and extension_atr > _MAX_EXTENSION_ATR:
             trade_signal = "WATCH_ONLY"
-            reason = f"Extended {extension:.1f}×ATR above EMA20 — wait for pullback"
-        elif trade_signal == "STRONG_SHORT" and extension < -_MAX_EXTENSION_ATR:
+            reason = f"Extended {extension_atr:.1f}×ATR above EMA20 — wait for pullback"
+        elif trade_signal == "STRONG_SHORT" and extension_atr < -_MAX_EXTENSION_ATR:
             trade_signal = "WATCH_ONLY"
-            reason = f"Extended {abs(extension):.1f}×ATR below EMA20 — wait for pullback"
+            reason = f"Extended {abs(extension_atr):.1f}×ATR below EMA20 — wait for pullback"
+
+    if model_prob is not None and trade_signal not in ("AVOID", "WATCH_ONLY"):
+        reason += f" — P(win) {model_prob:.0%} vs {required_p:.0%} needed"
 
     # ATR-based stop/target/RR for actionable directions. Entry is the last completed
     # 5m close (yfinance has no bid/ask).
-    entry = last or close
-    levels = _trade_levels(dominant, entry, atr14) if trade_signal not in (
-        "AVOID", "WATCH_ONLY"
-    ) else {}
+    levels = provisional if trade_signal not in ("AVOID", "WATCH_ONLY") else {}
     if levels and levels.get("target_pct", 100.0) < MIN_TARGET_PCT:
         risk_notes.append(
             f"Target {levels['target_pct']:.2f}% of price — thin edge"
@@ -537,9 +677,20 @@ def score_ticker(
         "mtf_confluence": mtf_confluence,
         "sr_score": sr_bonus,
         "at_key_level": at_key_level,
+        "blocked_ahead": blocked_ahead,
         "nearest_support": nearest_support,
         "nearest_resistance": nearest_resistance,
         "sr_levels_json": json.dumps(sr_levels[:5]) if sr_levels else None,
+        "extension_atr": extension_atr,
+        "cost_pct": round(cost_pct, 4),
+        "cost_ratio": cost_ratio,
+        "model_prob": model_prob,
+        "required_prob": required_p,
+        "dominant": dominant,
+        # Levels the trade *would* use, exposed even when the signal is not actionable
+        # so feature extraction always sees a real stop size rather than a zero.
+        "prov_stop_pct": provisional.get("stop_pct"),
+        "prov_target_pct": provisional.get("target_pct"),
         "total_score": round(total, 1),
         "trade_signal": trade_signal,
         "signal_reason": reason,

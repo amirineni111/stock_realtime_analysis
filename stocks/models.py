@@ -24,6 +24,11 @@ class StockQuote(BaseModel):
 
 
 class StockSnapshot(BaseModel):
+    # "model_prob" / "required_prob" describe the direction model, not pydantic's
+    # own model_* namespace — opt out of the shadowing warning rather than rename
+    # fields that the DB columns and the feature contract already use.
+    model_config = {"protected_namespaces": ()}
+
     ticker: str
     last: Optional[float] = None
     prev_close: Optional[float] = None
@@ -78,11 +83,20 @@ class StockSnapshot(BaseModel):
     nearest_resistance: Optional[float] = None
     sr_score: float = 0.0
     at_key_level: bool = False
+    blocked_ahead: bool = False
     sr_levels_json: Optional[str] = None
     # Relative strength vs SPY
     rs_vs_spy: Optional[float] = None
     spy_change_pct: Optional[float] = None
     rs_assessment: Optional[str] = None
+    # Volume / structure context
+    rel_volume: Optional[float] = None
+    extension_atr: Optional[float] = None
+    # Cost model + probability gate
+    cost_pct: Optional[float] = None
+    cost_ratio: Optional[float] = None
+    model_prob: Optional[float] = None
+    required_prob: Optional[float] = None
 
 
 class ScanRequest(BaseModel):

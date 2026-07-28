@@ -317,6 +317,27 @@ def detect_sr_levels(bars: List[dict], lookback: int = 50, n_pivot: int = 3) -> 
     return levels[:8]
 
 
+def calculate_relative_volume(bars: List[dict], lookback: int = 20) -> Optional[float]:
+    """
+    Last bar's volume as a multiple of the preceding ``lookback`` bars' average.
+
+    Volume is the main piece of information equities carry that FX does not: the
+    same breakout on 3× normal volume and on 0.4× normal volume are different
+    events. Returns None when there is no volume data (some feeds report 0).
+    """
+    if len(bars) < 2:
+        return None
+    prior = bars[-(lookback + 1):-1]
+    volumes = [b.get("volume") or 0 for b in prior]
+    if not volumes:
+        return None
+    avg = sum(volumes) / len(volumes)
+    if avg <= 0:
+        return None
+    last_vol = bars[-1].get("volume") or 0
+    return round(last_vol / avg, 3)
+
+
 def compute_all(bars: List[dict]) -> dict:
     """
     Compute all indicators from a list of bar dicts.
@@ -364,4 +385,5 @@ def compute_all(bars: List[dict]) -> dict:
         "bb_middle": bb_mid,
         "bb_lower": bb_lower,
         "bb_width_pct": bb_width,
+        "rel_volume": calculate_relative_volume(bars),
     }

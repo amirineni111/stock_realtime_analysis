@@ -14,6 +14,7 @@ from .indicators import (
     window_high_low,
 )
 from .signals import score_ticker, MIN_TARGET_PCT
+from .features import build_features, FEATURE_VERSION
 from .market_hours import (
     current_market_phase,
     market_open_today_utc,
@@ -47,6 +48,23 @@ def _avg_dollar_volume(d1_dicts: List[dict], days: int = 20) -> Optional[float]:
         return None
     values = [b["close"] * b["volume"] for b in recent]
     return round(sum(values) / len(values), 0)
+
+
+def _load_model(storage: Storage):
+    """Active direction model, or None when the loop has not been trained yet."""
+    try:
+        payload = storage.load_active_model_json()
+        if not payload:
+            return None
+        from .model import StockModel
+        model = StockModel.from_json(payload)
+        # A model trained on a different feature contract would be silently
+        # misaligned — refuse it rather than serve garbage probabilities.
+        if model.feature_version != FEATURE_VERSION:
+            return None
+        return model
+    except Exception:
+        return None
 
 
 def run_scan(
@@ -92,6 +110,11 @@ def run_scan(
     snapshots: List[StockSnapshot] = []
     quotes: List[StockQuote] = []
     bars_by_ticker: Dict[str, List[dict]] = {}
+    features_by_ticker: Dict[str, dict] = {}
+
+    # Loaded once per scan. None means the loop has not been trained yet, in which
+    # case the scanner runs rules-only and simply logs features.
+    model = _load_model(storage)
 
     for ticker in tickers:
         try:
@@ -143,19 +166,67 @@ def run_scan(
                 sr_levels += detect_sr_levels(h1_dicts, lookback=30)
             sr_levels.sort(key=lambda x: x["strength"], reverse=True)
 
-            scoring = score_ticker(
-                ticker=ticker,
-                last=last,
-                avg_dollar_volume=avg_dollar_volume,
-                indicators=indicators,
-                phase=phase,
-                minutes_since_open=mins_open,
-                minutes_to_close=mins_close,
-                min_avg_dollar_volume=request.min_avg_dollar_volume,
-                hourly_direction=hourly_direction,
-                daily_direction=daily_direction,
-                sr_levels=sr_levels,
+            # Relative strength vs SPY. Folded into the score (rather than added
+            # afterwards) so the number that drives the decision, the number shown
+            # on the dashboard, and the number the model trains on are all the same.
+            rs = calculate_rs(indicators.get("day_change_pct"), spy_change_pct)
+            assessment = rs_assessment(rs)
+
+            def _score(prob: Optional[float], bonus: float) -> dict:
+                return score_ticker(
+                    ticker=ticker,
+                    last=last,
+                    avg_dollar_volume=avg_dollar_volume,
+                    indicators=indicators,
+                    phase=phase,
+                    minutes_since_open=mins_open,
+                    minutes_to_close=mins_close,
+                    min_avg_dollar_volume=request.min_avg_dollar_volume,
+                    hourly_direction=hourly_direction,
+                    daily_direction=daily_direction,
+                    sr_levels=sr_levels,
+                    model_prob=prob,
+                    strength_bonus=bonus,
+                )
+
+            # RS alignment is judged against the raw directional read, not against
+            # the first-pass label — a countertrend setup downgraded to WATCH_ONLY
+            # still has a direction, and keying off the label would silently zero
+            # the bonus.
+            base = _score(None, 0.0)
+            dom = base.get("dominant")
+            bonus = rs_bonus(
+                assessment,
+                "STRONG_BUY" if dom == "LONG" else ("STRONG_SHORT" if dom == "SHORT" else "WATCH_ONLY"),
             )
+            scoring = _score(None, bonus) if bonus else base
+
+            # Features are built for every directional setup whether or not a model
+            # exists yet. Building them only when a model was loaded would deadlock
+            # the loop: no model means no logged features, which means no training
+            # data, which means a model can never be trained.
+            if scoring.get("dominant") in ("LONG", "SHORT"):
+                direction = 1 if scoring["dominant"] == "LONG" else -1
+                feat_snap = {
+                    **indicators, **scoring,
+                    "stop_pct": scoring.get("prov_stop_pct"),
+                    "hourly_direction": hourly_direction,
+                    "daily_direction": daily_direction,
+                    "avg_dollar_volume": avg_dollar_volume,
+                    "rs_vs_spy": rs,
+                    "as_of": as_of,
+                }
+                feats = build_features(feat_snap, direction)
+                features_by_ticker[ticker] = feats
+
+                if model is not None:
+                    try:
+                        model_prob = round(model.predict_proba(feats), 4)
+                    except Exception as exc:
+                        storage.log_ticker(scan_id, ticker, None, f"Model scoring failed: {exc}")
+                        model_prob = None
+                    if model_prob is not None:
+                        scoring = _score(model_prob, bonus)
 
             snapshot = StockSnapshot(
                 ticker=ticker,
@@ -209,7 +280,19 @@ def run_scan(
                 nearest_resistance=scoring.get("nearest_resistance"),
                 sr_score=scoring.get("sr_score", 0.0),
                 at_key_level=scoring.get("at_key_level", False),
+                blocked_ahead=scoring.get("blocked_ahead", False),
                 sr_levels_json=scoring.get("sr_levels_json"),
+                # Relative strength (folded into total_score above)
+                rs_vs_spy=rs,
+                spy_change_pct=spy_change_pct,
+                rs_assessment=assessment,
+                # Volume / structure / cost / model gating
+                rel_volume=indicators.get("rel_volume"),
+                extension_atr=scoring.get("extension_atr"),
+                cost_pct=scoring.get("cost_pct"),
+                cost_ratio=scoring.get("cost_ratio"),
+                model_prob=scoring.get("model_prob"),
+                required_prob=scoring.get("required_prob"),
             )
             snapshots.append(snapshot)
             bars_by_ticker[ticker] = bar_dicts
@@ -282,19 +365,24 @@ def run_scan(
                     target_dollars=s.target_dollars or 0.0,
                     atr14=s.atr14 or 0.0,
                     entry_ts=ticker_bars[-1]["timestamp"],
+                    # The feature vector as it stood when the trade was armed. This
+                    # is the row the next retrain learns from.
+                    features=features_by_ticker.get(s.ticker),
+                    feature_version=FEATURE_VERSION,
+                    model_prob=s.model_prob,
+                    required_prob=s.required_prob,
+                    cost_pct=s.cost_pct,
+                    cost_ratio=s.cost_ratio,
+                    total_score=s.total_score,
+                    adx14=s.adx14,
+                    regime=s.regime,
+                    market_phase=s.market_phase,
+                    rs_vs_spy=s.rs_vs_spy,
                 )
             except Exception as exc:
                 storage.log_ticker(scan_id, s.ticker, None, f"Tracking record failed: {exc}")
 
-    # Post-scan: relative strength vs SPY adjusts total_score (mirrors the forex
-    # currency-strength bonus).
-    for s in snapshots:
-        s.spy_change_pct = spy_change_pct
-        s.rs_vs_spy = calculate_rs(s.day_change_pct, spy_change_pct)
-        s.rs_assessment = rs_assessment(s.rs_vs_spy)
-        s.total_score = round(s.total_score + rs_bonus(s.rs_assessment, s.trade_signal), 1)
-
-    # Sort by score descending (after RS adjustment)
+    # Sort by score descending (RS is already folded into total_score)
     snapshots.sort(key=lambda s: s.total_score, reverse=True)
     storage.save_snapshots(scan_id, snapshots)
 

@@ -96,10 +96,22 @@ def test_regime_weights():
 
 
 def test_mtf_confluence():
+    # The 5m direction is what gets confirmed, not a third vote.
     assert _mtf_confluence("LONG", "LONG", "LONG") == (30.0, "FULL")
-    assert _mtf_confluence("LONG", "LONG", "SHORT") == (15.0, "PARTIAL")
-    assert _mtf_confluence("LONG", "SHORT", None) == (0.0, "NONE")
+    assert _mtf_confluence("LONG", "LONG", None) == (15.0, "PARTIAL")
+    assert _mtf_confluence("LONG", "LONG", "SHORT") == (0.0, "CONFLICT")
+    assert _mtf_confluence("LONG", "SHORT", "SHORT") == (0.0, "OPPOSED")
     assert _mtf_confluence(None, None, None) == (0.0, "NONE")
+
+
+def test_mtf_confluence_requires_real_higher_timeframe_confirmation():
+    """
+    The regression this fix exists for: a 5m read with NOTHING confirming it used
+    to score FULL (+30 pts), which is most of what pushed mediocre setups over the
+    70-point STRONG threshold.
+    """
+    assert _mtf_confluence("LONG", None, None) == (0.0, "UNCONFIRMED")
+    assert _mtf_confluence("SHORT", "NEUTRAL", "NEUTRAL") == (0.0, "UNCONFIRMED")
 
 
 # ── relative strength ─────────────────────────────────────────────────────────

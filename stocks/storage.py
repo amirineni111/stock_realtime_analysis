@@ -1,10 +1,12 @@
 from __future__ import annotations
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
 from .models import StockSnapshot, StockQuote, ScanSummary
+from .timeutil import parse_ts
 
 SQLITE_TIMEOUT = 30.0
 SQLITE_BUSY_MS = 30000
@@ -172,6 +174,83 @@ class Storage:
                     avg_r           REAL,
                     expectancy      REAL
                 );
+
+                -- Trained direction models. Coefficients are stored inline so the
+                -- scanner can serve predictions without a model file on disk, and so
+                -- every historical model stays auditable against its own metrics.
+                CREATE TABLE IF NOT EXISTS stock_models (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at       TEXT DEFAULT CURRENT_TIMESTAMP,
+                    feature_version  INTEGER,
+                    algo             TEXT,
+                    n_train          INTEGER,
+                    n_test           INTEGER,
+                    auc              REAL,
+                    brier            REAL,
+                    top_decile_prec  REAL,
+                    base_rate        REAL,
+                    model_json       TEXT,
+                    metrics_json     TEXT,
+                    is_active        INTEGER DEFAULT 0,
+                    notes            TEXT
+                );
+            """)
+
+        # Additive column migrations, safe to re-run on every startup.
+        migrations = {
+            "stock_snapshots": [
+                ("blocked_ahead", "INTEGER DEFAULT 0"),
+                ("rel_volume", "REAL"),
+                ("extension_atr", "REAL"),
+                ("cost_pct", "REAL"),
+                ("cost_ratio", "REAL"),
+                ("model_prob", "REAL"),
+                ("required_prob", "REAL"),
+            ],
+            # The feature snapshot at arm time. Without this the outcome rows are
+            # unlearnable — every input was previously discarded the moment the
+            # snapshot table was pruned, which is what blocked any model work.
+            "stock_signal_tracking": [
+                ("features_json", "TEXT"),
+                ("feature_version", "INTEGER"),
+                ("model_prob", "REAL"),
+                ("required_prob", "REAL"),
+                ("cost_pct", "REAL"),
+                ("cost_ratio", "REAL"),
+                ("total_score", "REAL"),
+                ("adx14", "REAL"),
+                ("regime", "TEXT"),
+                ("market_phase", "TEXT"),
+                ("rs_vs_spy", "REAL"),
+            ],
+            # tracking_id closes the loop: an outcome can now be joined back to the
+            # exact feature vector that produced it.
+            "stock_trade_outcomes": [
+                ("tracking_id", "INTEGER"),
+                ("gross_dollars", "REAL"),
+                ("cost_dollars", "REAL"),
+                ("net_dollars", "REAL"),
+                ("exit_ts", "TEXT"),
+                ("exit_reason", "TEXT"),
+            ],
+        }
+        for table, cols in migrations.items():
+            for col, typedef in cols:
+                try:
+                    with self._connect() as conn:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}")
+                except sqlite3.OperationalError:
+                    pass  # column already exists
+
+        # Indexes go last — they reference columns added by the migrations above.
+        with self._connect() as conn:
+            conn.executescript("""
+                CREATE INDEX IF NOT EXISTS idx_stock_tracking_status
+                    ON stock_signal_tracking(status, ticker);
+                CREATE INDEX IF NOT EXISTS idx_stock_outcomes_tracking
+                    ON stock_trade_outcomes(tracking_id);
+                CREATE INDEX IF NOT EXISTS idx_stock_models_active
+                    ON stock_models(is_active, created_at);
             """)
 
     # ── Scan run lifecycle ──────────────────────────────────────────────────
@@ -231,6 +310,9 @@ class Storage:
                 s.nearest_support, s.nearest_resistance, s.sr_score,
                 int(s.at_key_level), s.sr_levels_json,
                 s.rs_vs_spy, s.spy_change_pct, s.rs_assessment,
+                # Structure / volume / cost / model gating
+                int(s.blocked_ahead), s.rel_volume, s.extension_atr,
+                s.cost_pct, s.cost_ratio, s.model_prob, s.required_prob,
             ))
         with self._connect() as conn:
             conn.executemany(
@@ -246,9 +328,12 @@ class Storage:
                 "stop_dollars,target_dollars,stop_pct,rr_ratio,"
                 "hourly_direction,daily_direction,mtf_score,mtf_confluence,"
                 "nearest_support,nearest_resistance,sr_score,at_key_level,sr_levels_json,"
-                "rs_vs_spy,spy_change_pct,rs_assessment) "
+                "rs_vs_spy,spy_change_pct,rs_assessment,"
+                "blocked_ahead,rel_volume,extension_atr,"
+                "cost_pct,cost_ratio,model_prob,required_prob) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-                "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                "?,?,?,?,?,?,?)",
                 rows,
             )
 
@@ -441,13 +526,29 @@ class Storage:
         self, ticker: str, signal: str, direction: int,
         entry: float, stop: float, target: float,
         stop_dollars: float, target_dollars: float, atr14: float, entry_ts: str,
-    ) -> None:
+        features: Optional[dict] = None,
+        feature_version: Optional[int] = None,
+        model_prob: Optional[float] = None,
+        required_prob: Optional[float] = None,
+        cost_pct: Optional[float] = None,
+        cost_ratio: Optional[float] = None,
+        total_score: Optional[float] = None,
+        adx14: Optional[float] = None,
+        regime: Optional[str] = None,
+        market_phase: Optional[str] = None,
+        rs_vs_spy: Optional[float] = None,
+    ) -> Optional[int]:
         """
         Record an actionable signal for hands-off forward evaluation. Skips if an
         open signal already exists for this ticker+direction (avoids re-arming every
         scan), or if one was armed within the cooldown window — without this, every
         scan after a stop-out immediately re-enters the same chop and racks up
         correlated losses.
+
+        ``features`` is the model feature vector captured **at arm time**. Storing it
+        here (rather than recomputing later from a snapshot that has since been pruned)
+        is what makes the outcome learnable. Returns the new tracking id, or None if
+        the signal was suppressed by the dedupe/cooldown rule.
         """
         with self._connect() as conn:
             existing = conn.execute(
@@ -458,14 +559,21 @@ class Storage:
                 (ticker, direction, f"-{self.REARM_COOLDOWN_MINUTES} minutes"),
             ).fetchone()
             if existing:
-                return
-            conn.execute(
+                return None
+            cur = conn.execute(
                 "INSERT INTO stock_signal_tracking "
                 "(ticker,signal,direction,entry_price,stop_price,target_price,"
-                "stop_dollars,target_dollars,atr14,entry_ts) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "stop_dollars,target_dollars,atr14,entry_ts,"
+                "features_json,feature_version,model_prob,required_prob,"
+                "cost_pct,cost_ratio,total_score,adx14,regime,market_phase,rs_vs_spy) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ticker, signal, direction, entry, stop, target,
-                 stop_dollars, target_dollars, atr14, entry_ts),
+                 stop_dollars, target_dollars, atr14, entry_ts,
+                 json.dumps(features) if features else None, feature_version,
+                 model_prob, required_prob, cost_pct, cost_ratio,
+                 total_score, adx14, regime, market_phase, rs_vs_spy),
             )
+            return cur.lastrowid
 
     def evaluate_tracked_signals(
         self, ticker: str, bars: List[dict], max_hold_hours: float = 8.0,
@@ -478,6 +586,12 @@ class Storage:
         Note: max_hold uses wall-clock age, so a signal armed near the close typically
         times out on the next morning's first scan — acceptable for calibration.
         Returns the number of signals resolved.
+
+        Accounting is net of estimated transaction cost. Bars are last-trade prices,
+        so a bracket that touches its printed target still costs the spread to get in
+        and out — ``r_multiple`` is therefore computed from ``net_dollars``. Reporting
+        gross R overstates every result, and at these stop sizes the overstatement is
+        several percent of an R.
         """
         with self._connect() as conn:
             open_rows = [dict(r) for r in conn.execute(
@@ -502,47 +616,71 @@ class Storage:
 
             exit_price: Optional[float] = None
             outcome: Optional[str] = None
+            exit_ts: Optional[str] = None
+            exit_reason: Optional[str] = None
             for b in forward:
                 hi, lo = b["high"], b["low"]
                 if direction == 1:
                     if lo <= stop:        # stop checked first = conservative
-                        exit_price, outcome = stop, "LOSS"
+                        exit_price, outcome, exit_reason = stop, "LOSS", "STOP"
+                        exit_ts = b.get("timestamp")
                         break
                     if hi >= target:
-                        exit_price, outcome = target, "WIN"
+                        exit_price, outcome, exit_reason = target, "WIN", "TARGET"
+                        exit_ts = b.get("timestamp")
                         break
                 else:
                     if hi >= stop:
-                        exit_price, outcome = stop, "LOSS"
+                        exit_price, outcome, exit_reason = stop, "LOSS", "STOP"
+                        exit_ts = b.get("timestamp")
                         break
                     if lo <= target:
-                        exit_price, outcome = target, "WIN"
+                        exit_price, outcome, exit_reason = target, "WIN", "TARGET"
+                        exit_ts = b.get("timestamp")
                         break
 
+            created = self._parse_dt(row.get("created_at"))
             if outcome is None:
                 # Timeout: close at last available close once held longer than max_hold
-                created = self._parse_dt(row.get("created_at"))
                 aged_out = created is not None and (now - created).total_seconds() > max_hold_hours * 3600
                 if aged_out and forward:
                     exit_price = forward[-1]["close"]
-                    pnl = (exit_price - entry_price) * direction
-                    outcome = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BREAKEVEN")
+                    exit_ts = forward[-1].get("timestamp")
+                    exit_reason = "TIMEOUT"
                 else:
                     continue  # still live
 
-            exit_dollars = round((exit_price - entry_price) * direction, 4) if entry_price else 0.0
-            exit_pct = round(exit_dollars / entry_price * 100, 3) if entry_price else 0.0
-            r_multiple = round(exit_dollars / stop_dollars, 2) if stop_dollars and stop_dollars > 0 else None
-            created = self._parse_dt(row.get("created_at"))
-            hold_minutes = int((now - created).total_seconds() / 60) if created else None
+            gross_dollars = round((exit_price - entry_price) * direction, 4) if entry_price else 0.0
+            # Round-trip cost in dollars per share, from the cost tier recorded when
+            # the signal was armed. Falls back to zero only for legacy rows that
+            # predate cost logging.
+            cost_dollars = round((row.get("cost_pct") or 0.0) / 100.0 * entry_price, 4) if entry_price else 0.0
+            net_dollars = round(gross_dollars - cost_dollars, 4)
+            if exit_reason == "TIMEOUT":
+                outcome = "WIN" if net_dollars > 0 else ("LOSS" if net_dollars < 0 else "BREAKEVEN")
+            exit_pct = round(net_dollars / entry_price * 100, 3) if entry_price else 0.0
+            r_multiple = round(net_dollars / stop_dollars, 2) if stop_dollars and stop_dollars > 0 else None
+
+            # Real trade duration: entry bar → resolving bar. Measuring this as
+            # (now − created_at) instead reports how long until a scan happened to
+            # evaluate the row, which makes wins and losses look identically long.
+            entry_dt = self._parse_dt(entry_ts) or created
+            exit_dt = self._parse_dt(exit_ts)
+            if entry_dt and exit_dt:
+                hold_minutes = max(0, int((exit_dt - entry_dt).total_seconds() / 60))
+            else:
+                hold_minutes = None
 
             with self._connect() as conn:
                 conn.execute(
                     "INSERT INTO stock_trade_outcomes "
-                    "(watchlist_id,ticker,signal,entry_price,exit_price,exit_dollars,exit_pct,"
-                    "r_multiple,outcome,hold_minutes) VALUES (0,?,?,?,?,?,?,?,?,?)",
-                    (ticker, row.get("signal"), entry_price, exit_price, exit_dollars, exit_pct,
-                     r_multiple, outcome, hold_minutes),
+                    "(watchlist_id,tracking_id,ticker,signal,entry_price,exit_price,"
+                    "exit_dollars,exit_pct,gross_dollars,cost_dollars,net_dollars,"
+                    "r_multiple,outcome,hold_minutes,exit_ts,exit_reason) "
+                    "VALUES (0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (row["id"], ticker, row.get("signal"), entry_price, exit_price,
+                     net_dollars, exit_pct, gross_dollars, cost_dollars, net_dollars,
+                     r_multiple, outcome, hold_minutes, exit_ts, exit_reason),
                 )
                 conn.execute(
                     "UPDATE stock_signal_tracking SET status='closed' WHERE id=?",
@@ -554,20 +692,114 @@ class Storage:
             self.compute_and_save_performance()
         return resolved
 
-    @staticmethod
-    def _parse_dt(value: Optional[str]) -> Optional[datetime]:
-        if not value:
-            return None
-        try:
-            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-        except (ValueError, TypeError):
-            return None
+    _parse_dt = staticmethod(parse_ts)
 
     def load_tracked_signals(self, status: str = "open", limit: int = 200) -> list:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM stock_signal_tracking WHERE status=? "
                 "ORDER BY created_at DESC LIMIT ?", (status, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Model store / training data ─────────────────────────────────────────
+
+    def load_training_rows(self, feature_version: Optional[int] = None) -> list:
+        """
+        Resolved trades joined back to the feature vector captured at arm time.
+
+        Only rows with a stored ``features_json`` are usable — trades recorded before
+        feature logging existed are unlearnable and are excluded here rather than
+        silently imputed, which would teach the model from fabricated inputs.
+        Ordered oldest-first so a walk-forward split is just an index cut.
+        """
+        sql = (
+            "SELECT t.id AS tracking_id, t.features_json, t.feature_version, t.ticker, "
+            "       t.direction, t.signal, t.created_at, t.model_prob, "
+            "       o.outcome, o.r_multiple, o.net_dollars, o.exit_reason "
+            "FROM stock_signal_tracking t "
+            "JOIN stock_trade_outcomes o ON o.tracking_id = t.id "
+            "WHERE t.features_json IS NOT NULL AND o.outcome IS NOT NULL "
+        )
+        params: list = []
+        if feature_version is not None:
+            sql += "AND t.feature_version = ? "
+            params.append(feature_version)
+        sql += "ORDER BY t.created_at ASC, t.id ASC"
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+
+        out = []
+        for r in rows:
+            row = dict(r)
+            try:
+                row["features"] = json.loads(row.pop("features_json") or "{}")
+            except (ValueError, TypeError):
+                continue
+            if not row["features"]:
+                continue
+            out.append(row)
+        return out
+
+    def save_model(self, model_json: str, metrics: dict, activate: bool = True,
+                   notes: str = "") -> int:
+        """Persist a trained model and optionally make it the one the scanner serves."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO stock_models "
+                "(feature_version,algo,n_train,n_test,auc,brier,top_decile_prec,"
+                " base_rate,model_json,metrics_json,is_active,notes) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,0,?)",
+                (
+                    metrics.get("feature_version"), metrics.get("algo"),
+                    metrics.get("n_train"), metrics.get("n_test"),
+                    metrics.get("auc"), metrics.get("brier"),
+                    metrics.get("top_decile_prec"), metrics.get("base_rate"),
+                    model_json, json.dumps(metrics), notes,
+                ),
+            )
+            model_id = cur.lastrowid
+            if activate:
+                conn.execute("UPDATE stock_models SET is_active=0")
+                conn.execute("UPDATE stock_models SET is_active=1 WHERE id=?", (model_id,))
+        return model_id
+
+    def activate_model(self, model_id: int) -> bool:
+        """
+        Promote one stored model to active, deactivating every other.
+
+        Also used for rollback — promoting an older model id is a valid recovery
+        path when a newly promoted one turns out to behave badly live.
+        Returns False if the id does not exist.
+        """
+        with self._connect() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM stock_models WHERE id=?", (model_id,)
+            ).fetchone()
+            if not exists:
+                return False
+            conn.execute("UPDATE stock_models SET is_active=0")
+            conn.execute("UPDATE stock_models SET is_active=1 WHERE id=?", (model_id,))
+        return True
+
+    def deactivate_all_models(self) -> None:
+        """Fall back to rules-only scanning without deleting any model."""
+        with self._connect() as conn:
+            conn.execute("UPDATE stock_models SET is_active=0")
+
+    def load_active_model_json(self) -> Optional[str]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT model_json FROM stock_models WHERE is_active=1 "
+                "ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+        return row["model_json"] if row else None
+
+    def load_models(self, limit: int = 20) -> list:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id,created_at,algo,feature_version,n_train,n_test,auc,brier,"
+                "top_decile_prec,base_rate,is_active,notes "
+                "FROM stock_models ORDER BY created_at DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(r) for r in rows]
