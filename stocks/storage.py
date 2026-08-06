@@ -222,6 +222,16 @@ class Storage:
                 ("regime", "TEXT"),
                 ("market_phase", "TEXT"),
                 ("rs_vs_spy", "REAL"),
+                # Which mode produced model_prob. Rows scored by a gating model are a
+                # censored sample (only trades it allowed exist), so they cannot be
+                # pooled with shadow rows when judging the model.
+                ("model_mode", "TEXT"),
+            ],
+            # Shadow mode: a model scores every setup and logs its probability but
+            # never vetoes. An active model only ever gets outcomes for the trades it
+            # allowed, so its own gate censors the evidence needed to judge it.
+            "stock_models": [
+                ("is_shadow", "INTEGER DEFAULT 0"),
             ],
             # tracking_id closes the loop: an outcome can now be joined back to the
             # exact feature vector that produced it.
@@ -537,6 +547,7 @@ class Storage:
         regime: Optional[str] = None,
         market_phase: Optional[str] = None,
         rs_vs_spy: Optional[float] = None,
+        model_mode: Optional[str] = None,
     ) -> Optional[int]:
         """
         Record an actionable signal for hands-off forward evaluation. Skips if an
@@ -565,13 +576,15 @@ class Storage:
                 "(ticker,signal,direction,entry_price,stop_price,target_price,"
                 "stop_dollars,target_dollars,atr14,entry_ts,"
                 "features_json,feature_version,model_prob,required_prob,"
-                "cost_pct,cost_ratio,total_score,adx14,regime,market_phase,rs_vs_spy) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "cost_pct,cost_ratio,total_score,adx14,regime,market_phase,rs_vs_spy,"
+                "model_mode) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ticker, signal, direction, entry, stop, target,
                  stop_dollars, target_dollars, atr14, entry_ts,
                  json.dumps(features) if features else None, feature_version,
                  model_prob, required_prob, cost_pct, cost_ratio,
-                 total_score, adx14, regime, market_phase, rs_vs_spy),
+                 total_score, adx14, regime, market_phase, rs_vs_spy,
+                 model_mode),
             )
             return cur.lastrowid
 
@@ -779,7 +792,11 @@ class Storage:
             if not exists:
                 return False
             conn.execute("UPDATE stock_models SET is_active=0")
-            conn.execute("UPDATE stock_models SET is_active=1 WHERE id=?", (model_id,))
+            # A model cannot shadow and gate at once: shadow numbers are only an
+            # honest preview while the model has no influence on what gets traded.
+            conn.execute(
+                "UPDATE stock_models SET is_active=1, is_shadow=0 WHERE id=?", (model_id,)
+            )
         return True
 
     def deactivate_all_models(self) -> None:
@@ -787,10 +804,45 @@ class Storage:
         with self._connect() as conn:
             conn.execute("UPDATE stock_models SET is_active=0")
 
+    def shadow_model(self, model_id: int) -> bool:
+        """
+        Run one model in shadow: scored and logged on every setup, never vetoing.
+
+        This is how a candidate earns promotion. An active model only ever sees
+        outcomes for trades it let through, so its live win rate is measured on a
+        censored sample and cannot say what the trades it blocked would have done.
+        A shadow model is scored on every directional setup the rules propose, so
+        its probabilities land on winners and losers alike and stay comparable.
+        Returns False if the id does not exist.
+        """
+        with self._connect() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM stock_models WHERE id=?", (model_id,)
+            ).fetchone()
+            if not exists:
+                return False
+            conn.execute("UPDATE stock_models SET is_shadow=0")
+            conn.execute(
+                "UPDATE stock_models SET is_shadow=1, is_active=0 WHERE id=?", (model_id,)
+            )
+        return True
+
+    def clear_shadow_model(self) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE stock_models SET is_shadow=0")
+
     def load_active_model_json(self) -> Optional[str]:
+        return self._load_model_json("is_active")
+
+    def load_shadow_model_json(self) -> Optional[str]:
+        return self._load_model_json("is_shadow")
+
+    def _load_model_json(self, flag: str) -> Optional[str]:
+        if flag not in ("is_active", "is_shadow"):      # guards the interpolation
+            raise ValueError(f"unknown model flag: {flag}")
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT model_json FROM stock_models WHERE is_active=1 "
+                f"SELECT model_json FROM stock_models WHERE {flag}=1 "
                 "ORDER BY created_at DESC LIMIT 1"
             ).fetchone()
         return row["model_json"] if row else None
@@ -799,7 +851,7 @@ class Storage:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT id,created_at,algo,feature_version,n_train,n_test,auc,brier,"
-                "top_decile_prec,base_rate,is_active,notes "
+                "top_decile_prec,base_rate,is_active,is_shadow,notes "
                 "FROM stock_models ORDER BY created_at DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(r) for r in rows]

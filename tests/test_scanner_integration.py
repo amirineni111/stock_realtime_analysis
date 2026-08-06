@@ -177,6 +177,19 @@ class TestModelVeto:
         storage.save_model(model.to_json(), {"feature_version": FEATURE_VERSION},
                            activate=True)
 
+    def _shadow(self, storage: Storage, intercept: float) -> None:
+        """Same constant model, but parked in the logging-only lane."""
+        model = StockModel(
+            coefficients=[0.0] * len(FEATURE_NAMES),
+            intercept=intercept,
+            mean=[0.0] * len(FEATURE_NAMES),
+            std=[1.0] * len(FEATURE_NAMES),
+        )
+        model_id = storage.save_model(model.to_json(),
+                                      {"feature_version": FEATURE_VERSION},
+                                      activate=False)
+        storage.shadow_model(model_id)
+
     def test_pessimistic_model_vetoes_the_setup(self, env):
         settings, storage, request = env
         baseline = run_scan(settings, storage, request)
@@ -204,6 +217,46 @@ class TestModelVeto:
         assert gated["model_prob"] > gated["required_prob"]
         # The label can only stay the same or be downgraded, never upgraded.
         assert gated["trade_signal"] == rules_only["trade_signal"]
+
+    def test_shadow_model_scores_without_touching_the_label(self, env):
+        """The whole point of shadow: a probability that would have vetoed still
+        gets logged, but the rules signal reaches the dashboard untouched."""
+        settings, storage, request = env
+        run_scan(settings, storage, request)
+        rules_only = next(s for s in storage.load_latest_snapshots() if s["ticker"] == "AAPL")
+
+        self._shadow(storage, intercept=-6.0)        # would veto if it were gating
+        run_scan(settings, storage, request)
+        shadowed = next(s for s in storage.load_latest_snapshots() if s["ticker"] == "AAPL")
+
+        assert shadowed["model_prob"] is not None
+        assert shadowed["model_prob"] < shadowed["required_prob"]
+        assert shadowed["trade_signal"] == rules_only["trade_signal"]
+
+    def test_shadow_rows_are_tagged_so_the_report_can_separate_them(self, env):
+        settings, storage, request = env
+        self._shadow(storage, intercept=-6.0)
+        run_scan(settings, storage, request)
+
+        tracked = storage.load_tracked_signals("open")
+        if not tracked:
+            pytest.skip("nothing armed on this synthetic series")
+        assert tracked[0]["model_mode"] == "shadow"
+        assert tracked[0]["model_prob"] is not None
+
+    def test_an_active_model_takes_precedence_over_a_shadow_one(self, env):
+        """Two models scoring the same setup would make model_prob ambiguous, so the
+        gating one wins and the shadow is ignored until nothing is active."""
+        settings, storage, request = env
+        self._activate(storage, intercept=6.0)       # P(win) ~ 99.8%
+        self._shadow(storage, intercept=-6.0)        # P(win) ~ 0.2%
+        run_scan(settings, storage, request)
+
+        snap = next(s for s in storage.load_latest_snapshots() if s["ticker"] == "AAPL")
+        assert snap["model_prob"] > 0.9
+        tracked = storage.load_tracked_signals("open")
+        if tracked:
+            assert tracked[0]["model_mode"] == "active"
 
     def test_stale_feature_version_falls_back_to_rules_only(self, env):
         settings, storage, request = env

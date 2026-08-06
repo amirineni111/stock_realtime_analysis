@@ -424,6 +424,19 @@ class TestTrackingAndEvaluation:
         assert json.loads(row["features_json"]) == feats
         assert row["feature_version"] == FEATURE_VERSION
 
+    def test_model_mode_is_persisted_at_arm_time(self, storage):
+        storage.record_tracked_signal(
+            ticker="MSFT", signal="BUY_CANDIDATE", direction=1,
+            entry=100.0, stop=97.5, target=103.75,
+            stop_dollars=2.5, target_dollars=3.75, atr14=1.0,
+            entry_ts="2026-07-28T14:00:00+00:00",
+            model_prob=0.55, required_prob=0.44, model_mode="shadow",
+        )
+        row = storage.load_tracked_signals("open")[0]
+        # Without this, shadow rows and gated rows pool together in the report and
+        # the censored sample silently flatters the model.
+        assert row["model_mode"] == "shadow"
+
     def test_dedupe_suppresses_a_rearm(self, storage):
         kwargs = dict(
             ticker="AAPL", signal="BUY_CANDIDATE", direction=1,

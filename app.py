@@ -428,7 +428,7 @@ def _page_scanner(
 | stop_dollars / target_dollars / stop_pct | Risk and reward in $ per share; stop as % of entry |
 | mtf_score / mtf_confluence | Multi-timeframe agreement: 5m + hourly + daily (0/15/30) |
 | hourly_direction / daily_direction | Higher-timeframe trend (LONG/SHORT/NEUTRAL) |
-| model_prob / required_prob | Trained model's P(target before stop), and the cost-adjusted breakeven it must clear. Blank until a model is activated |
+| model_prob / required_prob | Trained model's P(target before stop), and the cost-adjusted breakeven it must clear. Blank until a model is activated or shadowing; a shadow model fills it in without vetoing anything |
 | cost_pct / cost_ratio | Estimated round-trip cost as % of price, and as a fraction of the stop distance (>15% is vetoed) |
 | sr_score / at_key_level / blocked_ahead | Direction-aware structure score (−25 to +25): rewards a level behind the trade, penalizes one blocking the target |
 | rel_volume | Last 5m bar's volume vs the prior 20 bars' average (2.0 = twice normal) |
@@ -623,6 +623,7 @@ def _page_scanner(
 
         models = storage.load_models()
         active = next((m for m in models if m["is_active"]), None)
+        shadow = next((m for m in models if m.get("is_shadow")), None)
 
         if not models:
             st.warning("No model trained yet — the scanner is running rules-only.")
@@ -639,6 +640,12 @@ def _page_scanner(
                     f"Active model's out-of-sample AUC is {active['auc']:.4f} — "
                     "close to the 0.50 no-skill line. Treat its vetoes as weak evidence."
                 )
+        elif shadow:
+            st.info(
+                f"Model #{shadow['id']} is shadowing — it scores every directional setup "
+                "and logs the probability, but nothing is gated. Signals are rules-only. "
+                "Check what it would have done with `python scripts/model_report.py`."
+            )
         else:
             st.info("Models exist but none is active. The scanner is running rules-only.")
 
@@ -784,6 +791,24 @@ sample size.
                     use_container_width=True, hide_index=True,
                 )
 
+            st.markdown("#### Run in shadow (recommended first step)")
+            st.caption(
+                "Shadow scores every setup and logs the probability, but never vetoes. "
+                "It is the only way to find out what the model would do to the trades it "
+                "wants to block — once it is gating, those trades stop happening and stop "
+                "being measurable. Check progress with `python scripts/model_report.py`."
+            )
+            if st.button(f"Run model #{rep['id']} in shadow"):
+                if storage.shadow_model(rep["id"]):
+                    st.success(
+                        f"Model #{rep['id']} is now shadowing. Nothing is gated; "
+                        f"probabilities are logged against every tracked trade."
+                    )
+                    st.session_state.model_report = None
+                    st.rerun()
+                else:
+                    st.error("Could not set shadow — model id not found.")
+
             st.markdown("#### Promote")
             if rep["passes"]:
                 st.caption("This model clears the gate. Promoting makes it veto live signals "
@@ -814,17 +839,22 @@ sample size.
             st.markdown("### Model history")
             st.dataframe(pd.DataFrame(models), use_container_width=True, hide_index=True)
 
-            h1, h2 = st.columns([3, 1])
+            def _label(i: int) -> str:
+                m = next((x for x in models if x["id"] == i), {})
+                tag = " (active)" if m.get("is_active") else (
+                    " (shadow)" if m.get("is_shadow") else "")
+                return f"#{i}{tag}"
+
+            h1, h2, h3 = st.columns([3, 1, 1])
             options = [m["id"] for m in models]
-            pick = h1.selectbox(
-                "Roll back to a previous model", options,
-                format_func=lambda i: (
-                    f"#{i}" + (" (active)" if any(m["id"] == i and m["is_active"] for m in models) else "")
-                ),
-            )
+            pick = h1.selectbox("Select a model", options, format_func=_label)
             if h2.button("Activate", key="rollback_activate"):
                 if storage.activate_model(int(pick)):
-                    st.success(f"Model #{pick} is now active.")
+                    st.success(f"Model #{pick} is now active and gating.")
+                    st.rerun()
+            if h3.button("Shadow", key="rollback_shadow"):
+                if storage.shadow_model(int(pick)):
+                    st.success(f"Model #{pick} is now shadowing (logging only).")
                     st.rerun()
 
             if active and st.button("Disable model (revert to rules-only)"):
@@ -832,9 +862,15 @@ sample size.
                 st.info("All models deactivated — the scanner is rules-only again.")
                 st.rerun()
 
+            if shadow and st.button("Stop shadowing"):
+                storage.clear_shadow_model()
+                st.info("Shadow cleared — no model is scoring.")
+                st.rerun()
+
         st.caption(
             "Equivalent CLI, if you prefer it: `python scripts/train_model.py` to evaluate, "
-            "`--activate` to promote in one step."
+            "`--activate` to promote in one step, and `python scripts/model_report.py` to "
+            "judge a shadow model on resolved trades."
         )
 
     # ── Scan Logs tab ─────────────────────────────────────────────────────────

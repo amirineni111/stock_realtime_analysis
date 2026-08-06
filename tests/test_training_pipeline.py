@@ -159,6 +159,46 @@ class TestCandidateAndPromotion:
         assert save_candidate(storage, report) is None
         assert storage.load_models() == []
 
+    def test_shadow_model_is_served_but_not_active(self, storage):
+        _seed(storage, 400, signal_strength=2.0)
+        mid = save_candidate(storage, evaluate_and_fit(storage, folds=4))
+        assert storage.shadow_model(mid) is True
+        # Shadow is the offline lane: the scanner can score with it, but nothing
+        # gates on it, so load_active_model_json must stay empty.
+        assert storage.load_active_model_json() is None
+        assert storage.load_shadow_model_json() is not None
+
+    def test_a_model_cannot_gate_and_shadow_at_once(self, storage):
+        _seed(storage, 400, signal_strength=2.0)
+        mid = save_candidate(storage, evaluate_and_fit(storage, folds=4))
+        storage.shadow_model(mid)
+        storage.activate_model(mid)
+        row = [m for m in storage.load_models() if m["id"] == mid][0]
+        assert (row["is_active"], row["is_shadow"]) == (1, 0)
+        # And back the other way, so promotion is reversible into shadow.
+        storage.shadow_model(mid)
+        row = [m for m in storage.load_models() if m["id"] == mid][0]
+        assert (row["is_active"], row["is_shadow"]) == (0, 1)
+
+    def test_only_one_model_shadows_at_a_time(self, storage):
+        _seed(storage, 400, signal_strength=2.0)
+        first = save_candidate(storage, evaluate_and_fit(storage, folds=4))
+        second = save_candidate(storage, evaluate_and_fit(storage, folds=4, l2=5.0))
+        storage.shadow_model(first)
+        storage.shadow_model(second)
+        assert [m["id"] for m in storage.load_models() if m["is_shadow"]] == [second]
+
+    def test_shadowing_a_missing_id_is_rejected(self, storage):
+        assert storage.shadow_model(99999) is False
+
+    def test_clear_shadow_leaves_the_model_stored(self, storage):
+        _seed(storage, 400, signal_strength=2.0)
+        mid = save_candidate(storage, evaluate_and_fit(storage, folds=4))
+        storage.shadow_model(mid)
+        storage.clear_shadow_model()
+        assert storage.load_shadow_model_json() is None
+        assert any(m["id"] == mid for m in storage.load_models())
+
     def test_promoted_model_serves_the_same_predictions(self, storage):
         _seed(storage, 400, signal_strength=2.0)
         report = evaluate_and_fit(storage, folds=4)
@@ -203,6 +243,21 @@ class TestScannerServing:
     def test_no_model_means_rules_only(self, storage):
         from stocks.scanner import _load_model
         assert _load_model(storage) is None
+
+    def test_a_shadow_model_is_only_served_to_the_shadow_lane(self, storage):
+        from stocks.scanner import _load_model
+
+        model = StockModel(
+            coefficients=[0.0] * len(FEATURE_NAMES), intercept=0.0,
+            mean=[0.0] * len(FEATURE_NAMES), std=[1.0] * len(FEATURE_NAMES),
+        )
+        mid = storage.save_model(model.to_json(), {"feature_version": FEATURE_VERSION},
+                                 activate=False)
+        storage.shadow_model(mid)
+        # If this leaked into the gating lane the scanner would veto on a model the
+        # user explicitly chose not to promote.
+        assert _load_model(storage) is None
+        assert _load_model(storage, shadow=True) is not None
 
     def test_corrupt_model_json_does_not_crash_the_scan(self, storage):
         from stocks.scanner import _load_model

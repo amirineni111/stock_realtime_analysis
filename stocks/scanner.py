@@ -50,10 +50,18 @@ def _avg_dollar_volume(d1_dicts: List[dict], days: int = 20) -> Optional[float]:
     return round(sum(values) / len(values), 0)
 
 
-def _load_model(storage: Storage):
-    """Active direction model, or None when the loop has not been trained yet."""
+def _load_model(storage: Storage, shadow: bool = False):
+    """
+    The active (gating) model, or with ``shadow=True`` the shadow (logging-only) one.
+
+    Returns None when the loop has not been trained yet, or when the stored model
+    was trained against a different feature contract.
+    """
     try:
-        payload = storage.load_active_model_json()
+        payload = (
+            storage.load_shadow_model_json() if shadow
+            else storage.load_active_model_json()
+        )
         if not payload:
             return None
         from .model import StockModel
@@ -115,6 +123,9 @@ def run_scan(
     # Loaded once per scan. None means the loop has not been trained yet, in which
     # case the scanner runs rules-only and simply logs features.
     model = _load_model(storage)
+    # Only consulted when nothing is gating, so a shadow run is never mistaken for a
+    # live one and the two can never both touch the same probability.
+    shadow_model = _load_model(storage, shadow=True) if model is None else None
 
     for ticker in tickers:
         try:
@@ -219,14 +230,22 @@ def run_scan(
                 feats = build_features(feat_snap, direction)
                 features_by_ticker[ticker] = feats
 
-                if model is not None:
+                scorer = model or shadow_model
+                if scorer is not None:
                     try:
-                        model_prob = round(model.predict_proba(feats), 4)
+                        model_prob = round(scorer.predict_proba(feats), 4)
                     except Exception as exc:
                         storage.log_ticker(scan_id, ticker, None, f"Model scoring failed: {exc}")
                         model_prob = None
                     if model_prob is not None:
-                        scoring = _score(model_prob, bonus)
+                        if model is not None:
+                            scoring = _score(model_prob, bonus)
+                        else:
+                            # Shadow: record the probability and the bar it would have
+                            # had to clear, but leave trade_signal exactly as the rules
+                            # set it. Rescoring here would re-introduce the veto by the
+                            # back door.
+                            scoring = {**scoring, "model_prob": model_prob}
 
             snapshot = StockSnapshot(
                 ticker=ticker,
@@ -378,6 +397,10 @@ def run_scan(
                     regime=s.regime,
                     market_phase=s.market_phase,
                     rs_vs_spy=s.rs_vs_spy,
+                    model_mode=(
+                        "active" if model is not None
+                        else ("shadow" if shadow_model is not None else None)
+                    ),
                 )
             except Exception as exc:
                 storage.log_ticker(scan_id, s.ticker, None, f"Tracking record failed: {exc}")

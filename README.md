@@ -51,13 +51,23 @@ swap roles: the model can only veto, never promote something the rules rejected.
 4. **Gate.** A candidate is saved **inactive**. It only passes if it beats chance
    out of sample *and* turns a profit at its decision threshold — promoting is a
    separate, deliberate click, and any earlier model can be rolled back.
-5. **Serve.** The active model scores each setup live. Below the cost-adjusted
+5. **Shadow.** Before gating on it, run the candidate in **shadow**: it scores every
+   directional setup and logs the probability, but vetoes nothing. This is the only
+   way to learn what it would do to the trades it wants to block — once it is gating,
+   those trades stop happening and stop being measurable. `scripts/model_report.py`
+   then judges it on real resolved outcomes rather than on its own training split.
+   Tracked rows record which mode produced their probability (`model_mode`), because
+   gated rows are a censored sample and must never be pooled with shadow rows.
+6. **Serve.** The active model scores each setup live. Below the cost-adjusted
    breakeven win rate plus a margin, an otherwise-actionable signal is downgraded
-   to WATCH_ONLY with the reason shown.
+   to WATCH_ONLY with the reason shown. Only one model gates and at most one shadows;
+   whenever something is gating, the shadow lane is ignored.
 
 ```
 python scripts/train_model.py              # evaluate + save a candidate, do not activate
 python scripts/train_model.py --activate   # promote it, if it clears the gate
+python scripts/model_report.py             # judge a shadow model on resolved trades
+python scripts/model_report.py --mode any  # include rows armed before mode tracking
 python scripts/backfill_links.py --apply   # one-off: link pre-existing outcome rows
 ```
 
@@ -97,6 +107,7 @@ stocks/
   config.py, tickers.py, refresh.py
 scripts/
   train_model.py          Retrain from the CLI, with the same gate as the dashboard
+  model_report.py         Judge a shadow/active model on live resolved trades
   backfill_links.py       One-off link of legacy outcome rows to their tracking rows
 tests/                    pytest suite (140 tests, all offline)
 ```
