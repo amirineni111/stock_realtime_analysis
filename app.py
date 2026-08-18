@@ -9,6 +9,7 @@ from streamlit_autorefresh import st_autorefresh
 
 from stocks.config import get_settings
 from stocks.features import FEATURE_VERSION
+from stocks.indices import INDEX_SYMBOLS
 from stocks.market_hours import current_market_phase, phase_badge_color
 from stocks.model import MIN_TRAIN_SAMPLES
 from stocks.models import ScanRequest
@@ -59,6 +60,8 @@ def _init_state() -> None:
         "allow_offhours": prefs.get("allow_offhours", False),
         "auto_refresh_count_last": 0,
         "quotes_auto_refresh_count_last": 0,
+        "paper_dialog_open": False,
+        "paper_flash": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -81,6 +84,437 @@ SIGNAL_COLORS = {
 
 def _signal_badge(signal: str) -> str:
     return f"{SIGNAL_COLORS.get(signal, '⚫')} {signal}"
+
+
+# ── Market index header strip ────────────────────────────────────────────────
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _index_quotes_cached() -> list:
+    """Index levels for the page header. Streamlit reruns the whole script on
+    every widget interaction, so cache to keep Yahoo requests at ~2/min.
+    Failures return [] and are cached too — an outage must not re-hit the API
+    on every rerun."""
+    from stocks.indices import fetch_index_quotes
+    try:
+        return [q.model_dump() for q in fetch_index_quotes()]
+    except Exception:
+        return []
+
+
+def _render_index_metrics(cols) -> None:
+    """Render one st.metric per index — current level, with points and percent
+    up/down as the delta. Streamlit colors the delta green/red from its sign."""
+    quotes = {q["ticker"]: q for q in _index_quotes_cached()}
+    for col, (sym, label) in zip(cols, INDEX_SYMBOLS):
+        q = quotes.get(sym)
+        if not q or q.get("last") is None:
+            col.metric(label, "—", help="Index data unavailable")
+            continue
+        last, prev = q["last"], q.get("prev_close")
+        delta = None
+        if prev:
+            delta = f"{last - prev:+,.2f} ({q['change_pct']:+.2f}%)"
+        col.metric(label, f"{last:,.2f}", delta=delta)
+
+
+def _page_header(title: str) -> None:
+    """Page H1 with the index strip on the same row."""
+    head_title, *head_idx = st.columns(
+        [3] + [1] * len(INDEX_SYMBOLS), vertical_alignment="bottom"
+    )
+    with head_title:
+        st.title(title)
+    _render_index_metrics(head_idx)
+
+
+# ── Paper trading ────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _position_quotes_cached(tickers: tuple) -> list:
+    """Live prices for held tickers, cached like the index strip so mark-to-market
+    doesn't re-hit Yahoo on every rerun. Takes a tuple — cache keys must hash."""
+    from stocks.paper import fetch_position_quotes
+    try:
+        return [q.model_dump() for q in fetch_position_quotes(list(tickers))]
+    except Exception:
+        return []
+
+
+def _last_prices(tickers) -> dict:
+    """{ticker: last} for the given tickers, empty on any fetch failure."""
+    unique = tuple(sorted({str(t).upper() for t in tickers if t}))
+    return {q["ticker"]: q["last"] for q in _position_quotes_cached(unique)}
+
+
+def _fnum(v, fmt: str = "{:,.2f}", dash: str = "—") -> str:
+    """Format a possibly-missing number without blowing up on None/NaN."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return dash
+    if f != f:  # NaN
+        return dash
+    return fmt.format(f)
+
+
+def _dialog_open() -> None:
+    """Auto-refresh reruns the whole script and would tear down an open modal,
+    losing whatever the user has typed. Suppress it while a ticket is up."""
+    st.session_state.paper_dialog_open = True
+
+
+def _dialog_done() -> None:
+    st.session_state.paper_dialog_open = False
+
+
+@st.dialog("Order Ticket")
+def _dialog_order_ticket(sel: dict, direction: int) -> None:
+    """Place a paper order, prefilled from the scanner's suggested levels."""
+    from stocks.paper import position_cost
+    from stocks.signals import trade_levels
+
+    ticker = str(sel.get("ticker", ""))
+    side_label = "Buy" if direction > 0 else "Sell / Short"
+    st.markdown(f"**{side_label} {ticker}**")
+
+    suggested = sel.get("suggested_entry") or sel.get("last") or 0.0
+    c1, c2 = st.columns(2)
+    qty = c1.number_input("Quantity (shares)", min_value=1, step=1, value=100, key="ot_qty")
+    entry = c2.number_input(
+        "Entry price", min_value=0.01, format="%.2f",
+        value=float(suggested) if suggested else 0.01, key="ot_entry",
+    )
+
+    # Re-derive stop/target from the same ATR math the scanner used, so changing
+    # the entry keeps the levels coherent instead of stranding the suggestion.
+    atr14 = sel.get("atr14")
+    levels = trade_levels("LONG" if direction > 0 else "SHORT", entry, atr14)
+    def_stop = levels.get("suggested_stop") or sel.get("suggested_stop") or 0.0
+    def_target = levels.get("suggested_target") or sel.get("suggested_target") or 0.0
+
+    c3, c4 = st.columns(2)
+    stop = c3.number_input("Stop price (0 = none)", min_value=0.0, format="%.2f",
+                           value=float(def_stop or 0.0), key="ot_stop")
+    target = c4.number_input("Target price (0 = none)", min_value=0.0, format="%.2f",
+                             value=float(def_target or 0.0), key="ot_target")
+
+    equity = st.session_state.get("paper_equity", 0.0) or 0.0
+    risk = abs(entry - stop) * qty if stop else 0.0
+    reward = abs(target - entry) * qty if target else 0.0
+    cost = position_cost(qty, entry)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Position cost", f"${cost:,.2f}")
+    m2.metric(
+        "Risk", f"${risk:,.2f}" if stop else "—",
+        help=f"{risk / equity * 100:.2f}% of equity" if stop and equity else None,
+    )
+    m3.metric("R:R", f"{reward / risk:.2f}" if risk else "—")
+    if stop and equity:
+        st.caption(f"Risking {risk / equity * 100:.2f}% of ${equity:,.2f} equity.")
+
+    # A stop on the wrong side isn't a stop — it would fill instantly.
+    bad_stop = bool(stop) and (
+        (direction > 0 and stop >= entry) or (direction < 0 and stop <= entry)
+    )
+    if bad_stop:
+        side = "below" if direction > 0 else "above"
+        st.error(f"Stop must be {side} the entry for a {side_label.lower()}.")
+
+    notes = st.text_input("Notes", key="ot_notes")
+
+    b1, b2 = st.columns(2)
+    if b1.button("Cancel", use_container_width=True, key="ot_cancel"):
+        _dialog_done()
+        st.rerun()
+    if b2.button("Place Order", type="primary", use_container_width=True,
+                 disabled=bad_stop, key="ot_place"):
+        st.session_state.paper_storage.open_paper_position(
+            ticker=ticker, direction=direction, qty=int(qty), price=float(entry),
+            stop=float(stop) or None, target=float(target) or None,
+            signal=str(sel.get("trade_signal") or ""), notes=notes,
+        )
+        _dialog_done()
+        st.session_state.paper_flash = (
+            f"{side_label} {int(qty)} {ticker} @ {entry:,.2f} — position opened."
+        )
+        st.rerun()
+
+
+@st.dialog("Add to Position")
+def _dialog_add_to_position(position: dict, last) -> None:
+    """Scale into an open position and preview the new average cost."""
+    from stocks.paper import scale_in
+
+    ticker = position["ticker"]
+    direction = int(position["direction"])
+    side = "LONG" if direction > 0 else "SHORT"
+    st.markdown(
+        f"**Add to {ticker} ({side})** — holding {int(position['qty'])} sh "
+        f"@ {position['avg_entry']:,.2f}"
+    )
+
+    c1, c2 = st.columns(2)
+    qty = c1.number_input("Add quantity", min_value=1, step=1, value=50, key="add_qty")
+    price = c2.number_input(
+        "Fill price", min_value=0.01, format="%.2f",
+        value=float(last) if last else float(position["avg_entry"]), key="add_price",
+    )
+
+    new_qty, new_avg = scale_in(
+        int(position["qty"]), float(position["avg_entry"]), int(qty), float(price)
+    )
+    m1, m2 = st.columns(2)
+    m1.metric("New size", f"{new_qty:,} sh")
+    m2.metric("New avg cost", f"{new_avg:,.2f}",
+              delta=f"{new_avg - float(position['avg_entry']):+,.2f}",
+              delta_color="off")
+
+    notes = st.text_input("Notes", key="add_notes")
+
+    b1, b2 = st.columns(2)
+    if b1.button("Cancel", use_container_width=True, key="add_cancel"):
+        _dialog_done()
+        st.rerun()
+    if b2.button("Add", type="primary", use_container_width=True, key="add_go"):
+        st.session_state.paper_storage.add_to_paper_position(
+            int(position["id"]), int(qty), float(price), notes
+        )
+        _dialog_done()
+        st.session_state.paper_flash = (
+            f"Added {int(qty)} {ticker} @ {price:,.2f} — now {new_qty:,} sh @ {new_avg:,.2f}."
+        )
+        st.rerun()
+
+
+@st.dialog("Close Position")
+def _dialog_close_position(position: dict, last) -> None:
+    """Close all or part of a position, previewing the P&L before committing."""
+    from stocks.paper import position_r_multiple, realized_pnl
+
+    ticker = position["ticker"]
+    direction = int(position["direction"])
+    open_qty = int(position["qty"])
+    avg = float(position["avg_entry"])
+    st.markdown(f"**Close {ticker}** — {open_qty} sh @ {avg:,.2f}")
+
+    c1, c2 = st.columns(2)
+    qty = c1.number_input("Quantity to close", min_value=1, max_value=open_qty,
+                          step=1, value=open_qty, key="cl_qty")
+    price = c2.number_input("Exit price", min_value=0.01, format="%.2f",
+                            value=float(last) if last else avg, key="cl_price")
+
+    pnl = realized_pnl(direction, avg, float(price), int(qty))
+    r = position_r_multiple(direction, avg, float(price), position.get("stop_price"))
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Realized P&L", f"${pnl:,.2f}", delta=f"{pnl:+,.2f}")
+    m2.metric("R multiple", f"{r:+.2f}R" if r is not None else "—")
+    m3.metric("Remaining", f"{open_qty - int(qty):,} sh")
+    if int(qty) < open_qty:
+        st.caption("Partial close — the position stays open with the remaining shares.")
+
+    notes = st.text_input("Notes", key="cl_notes")
+
+    b1, b2 = st.columns(2)
+    if b1.button("Cancel", use_container_width=True, key="cl_cancel"):
+        _dialog_done()
+        st.rerun()
+    if b2.button("Close Position", type="primary", use_container_width=True, key="cl_go"):
+        st.session_state.paper_storage.close_paper_position(
+            int(position["id"]), int(qty), float(price), notes
+        )
+        _dialog_done()
+        st.session_state.paper_flash = (
+            f"Closed {int(qty)} {ticker} @ {price:,.2f} — P&L ${pnl:,.2f}."
+        )
+        st.rerun()
+
+
+def _render_paper_tab(storage: Storage) -> None:
+    """Account equity, open positions marked to market, and the trade history."""
+    from stocks.paper import pnl_pct, position_r_multiple, unrealized_pnl
+
+    account = storage.paper_account()
+    open_positions = storage.load_paper_positions("open")
+
+    marks = _last_prices([p["ticker"] for p in open_positions])
+    open_pnl = 0.0
+    exposure = 0.0
+    for p in open_positions:
+        mark = marks.get(p["ticker"]) or p["avg_entry"]
+        open_pnl += unrealized_pnl(
+            int(p["direction"]), float(p["avg_entry"]), float(mark), int(p["qty"])
+        )
+        exposure += float(mark) * int(p["qty"])
+
+    total = account["equity"] + open_pnl
+    start = account["starting_equity"]
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Starting equity", f"${start:,.2f}")
+    k2.metric("Realized P&L", f"${account['realized_pnl']:,.2f}",
+              delta=f"{account['realized_pnl']:+,.2f}")
+    k3.metric("Open P&L", f"${open_pnl:,.2f}", delta=f"{open_pnl:+,.2f}")
+    k4.metric("Total equity", f"${total:,.2f}",
+              delta=f"{(total - start) / start * 100:+.2f}%" if start else None)
+    k5.metric("Exposure", f"${exposure:,.2f}",
+              help="Market value of open positions at the current mark")
+
+    st.subheader("Open Positions")
+    if not open_positions:
+        st.info("No open positions. Select a row in the Results tab and click Buy or Sell/Short.")
+    else:
+        rows = []
+        for p in open_positions:
+            direction = int(p["direction"])
+            avg = float(p["avg_entry"])
+            qty = int(p["qty"])
+            mark = marks.get(p["ticker"])
+            mark_px = float(mark) if mark else avg
+            rows.append({
+                "id": p["id"],
+                "ticker": p["ticker"],
+                "side": "LONG" if direction > 0 else "SHORT",
+                "qty": qty,
+                "avg_entry": avg,
+                "mark": mark_px if mark else None,
+                "stop": p.get("stop_price"),
+                "target": p.get("target_price"),
+                "open_pnl": unrealized_pnl(direction, avg, mark_px, qty),
+                "pnl_pct": pnl_pct(direction, avg, mark_px),
+                "R": position_r_multiple(direction, avg, mark_px, p.get("stop_price")),
+                "realized": p.get("realized_pnl") or 0.0,
+                "opened_at": p.get("opened_at"),
+            })
+        pos_df = pd.DataFrame(rows)
+
+        def _pnl_row(row):
+            try:
+                v = float(row.get("open_pnl") or 0)
+            except (TypeError, ValueError):
+                v = 0
+            if v > 0:
+                return ["background-color: #d8f3d8; color: #000000"] * len(row)
+            if v < 0:
+                return ["background-color: #f3d8d8; color: #000000"] * len(row)
+            return [""] * len(row)
+
+        st.dataframe(
+            pos_df.style.apply(_pnl_row, axis=1).format({
+                "avg_entry": "{:,.2f}", "mark": "{:,.2f}", "stop": "{:,.2f}",
+                "target": "{:,.2f}", "open_pnl": "{:+,.2f}", "pnl_pct": "{:+.2f}%",
+                "R": "{:+.2f}", "realized": "{:+,.2f}", "qty": "{:,.0f}",
+            }, na_rep="—"),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            "Marks are live 1-minute prices (30s cache). Positions close only when "
+            "you close them — nothing exits automatically."
+        )
+
+    st.subheader("Closed Trades")
+    closed = storage.load_paper_positions("closed")
+    if not closed:
+        st.info("No closed trades yet.")
+    else:
+        cdf = pd.DataFrame([{
+            "id": p["id"],
+            "ticker": p["ticker"],
+            "side": "LONG" if int(p["direction"]) > 0 else "SHORT",
+            "avg_entry": p["avg_entry"],
+            "realized": p.get("realized_pnl") or 0.0,
+            "signal": p.get("signal"),
+            "opened_at": p.get("opened_at"),
+            "closed_at": p.get("closed_at"),
+        } for p in closed])
+        wins = int((cdf["realized"] > 0).sum())
+        losses = int((cdf["realized"] < 0).sum())
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Closed trades", len(cdf))
+        c2.metric("Wins / Losses", f"{wins} / {losses}")
+        c3.metric("Win rate", f"{wins / len(cdf) * 100:.1f}%" if len(cdf) else "—")
+        st.dataframe(
+            cdf.style.format({"avg_entry": "{:,.2f}", "realized": "{:+,.2f}"}, na_rep="—"),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with st.expander("Fill History"):
+        fills = storage.load_paper_fills(limit=200)
+        if not fills:
+            st.caption("No fills yet.")
+        else:
+            fdf = pd.DataFrame(fills)[
+                ["fill_ts", "ticker", "kind", "side", "qty", "price", "realized_pnl", "notes"]
+            ]
+            st.dataframe(
+                fdf.style.format({"price": "{:,.2f}", "realized_pnl": "{:+,.2f}",
+                                  "qty": "{:,.0f}"}, na_rep="—"),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with st.expander("Account Settings"):
+        st.caption(
+            "Paper trades are stored separately from the model's forward-test record — "
+            "they never affect the Performance tab or model training."
+        )
+        new_equity = st.number_input(
+            "Starting equity ($)", min_value=100.0, step=1000.0,
+            value=float(start), format="%.2f", key="paper_start_equity",
+        )
+        r1, r2 = st.columns([1, 3])
+        if r1.button("Update starting equity"):
+            storage.set_paper_starting_equity(float(new_equity))
+            st.rerun()
+        confirm = r2.checkbox("I understand this deletes all paper positions and fills",
+                              key="paper_reset_confirm")
+        if st.button("Reset paper account", type="secondary", disabled=not confirm):
+            storage.reset_paper_account(float(new_equity))
+            st.session_state.paper_flash = "Paper account reset."
+            st.rerun()
+
+
+def _render_trade_actions(storage: Storage, sel) -> None:
+    """Buy/Sell when flat, Add/Close when a position is open. Sits under the
+    selected row's trade levels in the Results grid."""
+    ticker = str(sel.get("ticker") or "")
+    if not ticker:
+        return
+    position = storage.load_open_paper_position(ticker)
+    last = sel.get("last")
+
+    if not position:
+        b1, b2, _ = st.columns([1, 1, 4])
+        if b1.button("🟢 Buy", key="act_buy", use_container_width=True):
+            _dialog_open()
+            _dialog_order_ticket(sel.to_dict(), 1)
+        if b2.button("🔴 Sell / Short", key="act_sell", use_container_width=True):
+            _dialog_open()
+            _dialog_order_ticket(sel.to_dict(), -1)
+        return
+
+    from stocks.paper import unrealized_pnl
+
+    direction = int(position["direction"])
+    qty = int(position["qty"])
+    avg = float(position["avg_entry"])
+    mark = _last_prices([ticker]).get(ticker) or last or avg
+    open_pnl = unrealized_pnl(direction, avg, float(mark), qty)
+
+    b1, b2, b3 = st.columns([1, 1, 4])
+    if b1.button("➕ Add", key="act_add", use_container_width=True):
+        _dialog_open()
+        _dialog_add_to_position(position, mark)
+    if b2.button("✖ Close", key="act_close", use_container_width=True):
+        _dialog_open()
+        _dialog_close_position(position, mark)
+    b3.markdown(
+        f"**{'LONG' if direction > 0 else 'SHORT'}** {qty:,} sh @ {avg:,.2f} · "
+        f"mark {float(mark):,.2f} · "
+        f"{'🟢' if open_pnl >= 0 else '🔴'} **${open_pnl:,.2f}** open"
+    )
 
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
@@ -173,13 +607,15 @@ def _page_scanner(
     allow_offhours: bool,
     phase: str,
 ) -> None:
-    st.title("Stock Scanner")
+    _page_header("Stock Scanner")
 
     scan_phase_ok = phase == "REGULAR" or allow_offhours
 
-    # Auto-refresh wiring — suppressed off-hours unless the override is on.
+    # Auto-refresh wiring — suppressed off-hours unless the override is on, and
+    # while an order ticket is open (a rerun would tear the modal down mid-entry).
     auto_count = None
-    if auto_refresh and scan_phase_ok and selected_tickers:
+    ticket_open = st.session_state.get("paper_dialog_open", False)
+    if auto_refresh and scan_phase_ok and selected_tickers and not ticket_open:
         auto_count = st_autorefresh(interval=refresh_secs * 1000, key="scanner_autorefresh")
 
     auto_due = (
@@ -216,8 +652,14 @@ def _page_scanner(
             except Exception as exc:
                 st.error(f"Scan failed: {exc}")
 
-    tab_results, tab_watchlist, tab_perf, tab_model, tab_logs, tab_settings = st.tabs(
-        ["Results", "Watchlist", "Performance", "Model", "Scan Logs", "Settings"]
+    # A confirmation from a dialog that has since closed via st.rerun().
+    if st.session_state.get("paper_flash"):
+        st.success(st.session_state.paper_flash)
+        st.session_state.paper_flash = ""
+
+    (tab_results, tab_paper, tab_watchlist, tab_perf,
+     tab_model, tab_logs, tab_settings) = st.tabs(
+        ["Results", "Paper Trades", "Watchlist", "Performance", "Model", "Scan Logs", "Settings"]
     )
 
     # ── Results tab ──────────────────────────────────────────────────────────
@@ -409,6 +851,8 @@ def _page_scanner(
                 d5.metric("R:R", _num(sel.get("rr_ratio")))
                 if sel.get("signal_reason"):
                     st.caption(sel["signal_reason"])
+
+                _render_trade_actions(storage, sel)
             else:
                 st.caption("Select a row (checkbox on the left) to highlight it and see its trade levels.")
 
@@ -447,6 +891,10 @@ def _page_scanner(
                 file_name="stock_scan.csv",
                 mime="text/csv",
             )
+
+    # ── Paper Trades tab ─────────────────────────────────────────────────────
+    with tab_paper:
+        _render_paper_tab(storage)
 
     # ── Watchlist tab ────────────────────────────────────────────────────────
     with tab_watchlist:
@@ -901,7 +1349,7 @@ sample size.
 # ── Live Quotes page ─────────────────────────────────────────────────────────
 
 def _page_live_quotes(storage: Storage, selected_tickers: list, allow_offhours: bool, phase: str) -> None:
-    st.title("Live Quotes")
+    _page_header("Live Quotes")
 
     quotes_phase_ok = phase != "CLOSED" or allow_offhours
 
@@ -993,6 +1441,11 @@ def main() -> None:
 
     settings = get_settings()
     storage = Storage(settings.db_path)
+
+    # Dialogs run outside the page functions' scope, so hand them the storage
+    # handle and current equity through session state.
+    st.session_state.paper_storage = storage
+    st.session_state.paper_equity = storage.paper_account()["equity"]
 
     page = st.sidebar.radio(
         "Page",

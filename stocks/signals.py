@@ -423,7 +423,7 @@ def _regime_weights(adx14: Optional[float]) -> Tuple[float, float, str]:
     return round(t, 3), round(1 - t, 3), "MIXED"
 
 
-def _trade_levels(
+def trade_levels(
     direction: str,
     entry: Optional[float],
     atr14: Optional[float],
@@ -556,7 +556,7 @@ def score_ticker(
     # Computed from the stop we would actually use, so it reflects the real drag on
     # expectancy rather than an abstract bps number.
     entry_px = last or close
-    provisional = _trade_levels(dominant, entry_px, atr14)
+    provisional = trade_levels(dominant, entry_px, atr14)
     prov_stop_pct = provisional.get("stop_pct") or 0.0
     cost_pct = estimate_cost_pct(avg_dollar_volume)
     cost_ratio = round(cost_pct / prov_stop_pct, 4) if prov_stop_pct > 0 else None

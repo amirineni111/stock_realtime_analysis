@@ -163,6 +163,47 @@ class Storage:
                     created_at    TEXT DEFAULT CURRENT_TIMESTAMP
                 );
 
+                -- Manual paper trading. Deliberately separate from
+                -- stock_trade_outcomes: that table is the model's forward-test
+                -- record, and the Performance tab counts every row in it as a
+                -- prediction. User trades must never inflate those stats.
+                CREATE TABLE IF NOT EXISTS stock_paper_account (
+                    id               INTEGER PRIMARY KEY CHECK (id = 1),
+                    starting_equity  REAL NOT NULL DEFAULT 100000.0,
+                    created_at       TEXT DEFAULT CURRENT_TIMESTAMP,
+                    reset_at         TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS stock_paper_positions (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker        TEXT NOT NULL,
+                    direction     INTEGER NOT NULL,      -- +1 long / -1 short
+                    qty           INTEGER NOT NULL,      -- open shares; 0 once fully closed
+                    avg_entry     REAL NOT NULL,         -- weighted average cost
+                    stop_price    REAL,
+                    target_price  REAL,
+                    realized_pnl  REAL DEFAULT 0.0,      -- accumulates across partial closes
+                    signal        TEXT,                  -- trade_signal at open, for later review
+                    notes         TEXT,
+                    status        TEXT DEFAULT 'open',   -- 'open' | 'closed'
+                    opened_at     TEXT DEFAULT CURRENT_TIMESTAMP,
+                    closed_at     TEXT
+                );
+
+                -- Every fill is kept, so a position row is a running aggregate
+                -- that can always be re-derived from its own history.
+                CREATE TABLE IF NOT EXISTS stock_paper_fills (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    position_id  INTEGER NOT NULL,
+                    kind         TEXT NOT NULL,          -- 'OPEN' | 'ADD' | 'CLOSE'
+                    side         TEXT NOT NULL,          -- 'BUY' | 'SELL'
+                    qty          INTEGER NOT NULL,
+                    price        REAL NOT NULL,
+                    realized_pnl REAL,                   -- NULL on OPEN/ADD
+                    notes        TEXT,
+                    fill_ts      TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+
                 CREATE TABLE IF NOT EXISTS stock_performance_stats (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
                     computed_at     TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -261,6 +302,10 @@ class Storage:
                     ON stock_trade_outcomes(tracking_id);
                 CREATE INDEX IF NOT EXISTS idx_stock_models_active
                     ON stock_models(is_active, created_at);
+                CREATE INDEX IF NOT EXISTS idx_stock_paper_pos_status
+                    ON stock_paper_positions(status, ticker);
+                CREATE INDEX IF NOT EXISTS idx_stock_paper_fills_pos
+                    ON stock_paper_fills(position_id);
             """)
 
     # ── Scan run lifecycle ──────────────────────────────────────────────────
@@ -526,6 +571,195 @@ class Storage:
                 "SELECT * FROM stock_watchlist WHERE status=? ORDER BY created_at DESC",
                 (status,),
             ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Manual paper trading ────────────────────────────────────────────────
+    #
+    # Nothing here writes to stock_trade_outcomes or calls
+    # compute_and_save_performance(). Those belong to the model's forward test;
+    # mixing user trades in would corrupt its calibration record.
+
+    DEFAULT_STARTING_EQUITY = 100000.0
+
+    def paper_account(self) -> dict:
+        """The single account row, created on first use."""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO stock_paper_account (id, starting_equity) VALUES (1, ?)",
+                (self.DEFAULT_STARTING_EQUITY,),
+            )
+            row = conn.execute("SELECT * FROM stock_paper_account WHERE id=1").fetchone()
+            realized = conn.execute(
+                "SELECT COALESCE(SUM(realized_pnl), 0.0) FROM stock_paper_positions"
+            ).fetchone()[0]
+        account = dict(row)
+        account["realized_pnl"] = round(realized or 0.0, 2)
+        account["equity"] = round(account["starting_equity"] + account["realized_pnl"], 2)
+        return account
+
+    def set_paper_starting_equity(self, starting_equity: float) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO stock_paper_account (id, starting_equity) VALUES (1, ?) "
+                "ON CONFLICT(id) DO UPDATE SET starting_equity=excluded.starting_equity",
+                (float(starting_equity),),
+            )
+
+    def reset_paper_account(self, starting_equity: float) -> None:
+        """Wipe all paper positions and fills and restart from a fresh balance."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM stock_paper_fills")
+            conn.execute("DELETE FROM stock_paper_positions")
+            conn.execute(
+                "INSERT INTO stock_paper_account (id, starting_equity, reset_at) "
+                "VALUES (1, ?, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(id) DO UPDATE SET starting_equity=excluded.starting_equity, "
+                "reset_at=CURRENT_TIMESTAMP",
+                (float(starting_equity),),
+            )
+
+    def open_paper_position(
+        self, ticker: str, direction: int, qty: int, price: float,
+        stop: Optional[float] = None, target: Optional[float] = None,
+        signal: str = "", notes: str = "",
+    ) -> int:
+        """Open a position and record its first fill. Returns the position id."""
+        side = "BUY" if direction > 0 else "SELL"
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO stock_paper_positions "
+                "(ticker,direction,qty,avg_entry,stop_price,target_price,signal,notes) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (ticker.upper(), int(direction), int(qty), float(price),
+                 stop, target, signal, notes),
+            )
+            position_id = int(cur.lastrowid)
+            conn.execute(
+                "INSERT INTO stock_paper_fills (position_id,kind,side,qty,price,notes) "
+                "VALUES (?,'OPEN',?,?,?,?)",
+                (position_id, side, int(qty), float(price), notes),
+            )
+        return position_id
+
+    def add_to_paper_position(
+        self, position_id: int, qty: int, price: float, notes: str = "",
+    ) -> Optional[dict]:
+        """Scale into an open position, re-averaging the entry cost."""
+        from .paper import scale_in
+
+        position = self.load_paper_position(position_id)
+        if not position or position.get("status") != "open":
+            return None
+
+        new_qty, new_avg = scale_in(
+            int(position["qty"]), float(position["avg_entry"]), int(qty), float(price)
+        )
+        side = "BUY" if int(position["direction"]) > 0 else "SELL"
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE stock_paper_positions SET qty=?, avg_entry=? WHERE id=?",
+                (new_qty, new_avg, position_id),
+            )
+            conn.execute(
+                "INSERT INTO stock_paper_fills (position_id,kind,side,qty,price,notes) "
+                "VALUES (?,'ADD',?,?,?,?)",
+                (position_id, side, int(qty), float(price), notes),
+            )
+        return self.load_paper_position(position_id)
+
+    def close_paper_position(
+        self, position_id: int, qty: int, price: float, notes: str = "",
+    ) -> Optional[float]:
+        """Close all or part of a position. The position only flips to 'closed'
+        once the last share is out, so partial exits need no separate path.
+        Returns the dollar P&L realized by this close."""
+        from .paper import realized_pnl as _realized
+
+        position = self.load_paper_position(position_id)
+        if not position or position.get("status") != "open":
+            return None
+
+        open_qty = int(position["qty"])
+        close_qty = min(int(qty), open_qty)
+        if close_qty <= 0:
+            return None
+
+        direction = int(position["direction"])
+        pnl = _realized(direction, float(position["avg_entry"]), float(price), close_qty)
+        remaining = open_qty - close_qty
+        # Closing a long is a sell; closing a short is a buy-to-cover.
+        side = "SELL" if direction > 0 else "BUY"
+
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO stock_paper_fills "
+                "(position_id,kind,side,qty,price,realized_pnl,notes) "
+                "VALUES (?,'CLOSE',?,?,?,?,?)",
+                (position_id, side, close_qty, float(price), pnl, notes),
+            )
+            if remaining > 0:
+                conn.execute(
+                    "UPDATE stock_paper_positions "
+                    "SET qty=?, realized_pnl=COALESCE(realized_pnl,0)+? WHERE id=?",
+                    (remaining, pnl, position_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE stock_paper_positions "
+                    "SET qty=0, realized_pnl=COALESCE(realized_pnl,0)+?, "
+                    "status='closed', closed_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (pnl, position_id),
+                )
+        return pnl
+
+    def load_paper_position(self, position_id: int) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM stock_paper_positions WHERE id=?", (position_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def load_paper_positions(self, status: str = "open") -> list:
+        """Positions by status; status='all' returns every row."""
+        with self._connect() as conn:
+            if status == "all":
+                rows = conn.execute(
+                    "SELECT * FROM stock_paper_positions ORDER BY opened_at DESC"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM stock_paper_positions WHERE status=? ORDER BY opened_at DESC",
+                    (status,),
+                ).fetchall()
+        return [dict(r) for r in rows]
+
+    def load_open_paper_position(self, ticker: str) -> Optional[dict]:
+        """The open position for a ticker, if any — drives the Buy/Sell vs
+        Add/Close branch in the scanner grid."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM stock_paper_positions WHERE ticker=? AND status='open' "
+                "ORDER BY opened_at DESC LIMIT 1",
+                (ticker.upper(),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def load_paper_fills(self, position_id: Optional[int] = None, limit: int = 200) -> list:
+        with self._connect() as conn:
+            if position_id is None:
+                rows = conn.execute(
+                    "SELECT f.*, p.ticker FROM stock_paper_fills f "
+                    "LEFT JOIN stock_paper_positions p ON p.id = f.position_id "
+                    "ORDER BY f.fill_ts DESC, f.id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT f.*, p.ticker FROM stock_paper_fills f "
+                    "LEFT JOIN stock_paper_positions p ON p.id = f.position_id "
+                    "WHERE f.position_id=? ORDER BY f.fill_ts DESC, f.id DESC LIMIT ?",
+                    (position_id, limit),
+                ).fetchall()
         return [dict(r) for r in rows]
 
     # ── Automatic signal tracking / calibration ─────────────────────────────

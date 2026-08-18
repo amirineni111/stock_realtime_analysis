@@ -2,16 +2,16 @@ from stocks.signals import (
     _day_breakout,
     _mtf_confluence,
     _regime_weights,
-    _trade_levels,
+    trade_levels,
     score_ticker,
 )
 from stocks.relative_strength import calculate_rs, rs_assessment, rs_bonus
 
 
-# ── _trade_levels ─────────────────────────────────────────────────────────────
+# ── trade_levels ─────────────────────────────────────────────────────────────
 
 def test_trade_levels_long_atr_stop():
-    levels = _trade_levels("LONG", 100.0, 0.8)
+    levels = trade_levels("LONG", 100.0, 0.8)
     assert levels["suggested_entry"] == 100.0
     assert levels["suggested_stop"] == 98.0      # 2.5 × 0.8 = 2.0 > 0.50% floor
     assert levels["suggested_target"] == 103.0   # 1.5R
@@ -22,21 +22,21 @@ def test_trade_levels_long_atr_stop():
 
 
 def test_trade_levels_min_stop_pct_floor():
-    levels = _trade_levels("LONG", 100.0, 0.1)
+    levels = trade_levels("LONG", 100.0, 0.1)
     assert levels["stop_dollars"] == 0.5         # floor: 0.50% of 100 beats 2.5×0.1
     assert levels["suggested_stop"] == 99.5
 
 
 def test_trade_levels_short():
-    levels = _trade_levels("SHORT", 50.0, 1.0)
+    levels = trade_levels("SHORT", 50.0, 1.0)
     assert levels["suggested_stop"] == 52.5      # 2.5 × 1.0
     assert levels["suggested_target"] == 46.25   # 1.5R below entry
 
 
 def test_trade_levels_neutral_empty():
-    assert _trade_levels("NEUTRAL", 100.0, 0.8) == {}
-    assert _trade_levels("LONG", None, 0.8) == {}
-    assert _trade_levels("LONG", 100.0, 0.0) == {}
+    assert trade_levels("NEUTRAL", 100.0, 0.8) == {}
+    assert trade_levels("LONG", None, 0.8) == {}
+    assert trade_levels("LONG", 100.0, 0.0) == {}
 
 
 # ── _day_breakout ─────────────────────────────────────────────────────────────
