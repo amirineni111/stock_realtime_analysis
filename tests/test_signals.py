@@ -163,7 +163,8 @@ def _strong_long_kwargs(close: float, ema20: float, day_high: float) -> dict:
 
 def test_strong_buy_within_extension_limit_keeps_signal():
     # close 1.5×ATR above EMA20 — inside the 2×ATR limit
-    result = score_ticker(**_strong_long_kwargs(close=103.0, ema20=100.0, day_high=102.0))
+    result = score_ticker(**_strong_long_kwargs(close=103.0, ema20=100.0, day_high=102.0),
+                          max_entry_range_pos=None)
     assert result["trade_signal"] == "STRONG_BUY"
     assert result["suggested_stop"] == 98.0     # 2.5 × ATR(2.0) below entry
 
@@ -194,3 +195,59 @@ def test_strong_short_overextended_downgrades_to_watch_only():
     )
     assert result["trade_signal"] == "WATCH_ONLY"
     assert "Extended" in result["signal_reason"]
+
+
+# ── Pullback-entry gate ──────────────────────────────────────────────────────
+
+def test_entry_range_pos_is_oriented_to_the_trade():
+    from stocks.signals import entry_range_pos
+    assert entry_range_pos(100.0, 110.0, 100.0, "LONG") == -1.0   # long at the low
+    assert entry_range_pos(110.0, 110.0, 100.0, "LONG") == 1.0    # long at the high
+    assert entry_range_pos(110.0, 110.0, 100.0, "SHORT") == -1.0  # short at the high
+    assert entry_range_pos(105.0, 105.0, 105.0, "LONG") is None   # no range yet
+    assert entry_range_pos(105.0, 110.0, 100.0, "NEUTRAL") is None
+
+
+def test_pullback_gate_blocks_a_long_bought_at_the_day_high():
+    # Same STRONG_BUY setup that passes the extension test, closing at the high.
+    result = score_ticker(**_strong_long_kwargs(close=103.0, ema20=100.0, day_high=102.0))
+    assert result["trade_signal"] == "WATCH_ONLY"
+    assert "pullback" in result["signal_reason"]
+    assert result["suggested_entry"] is None
+    assert result["entry_range_pos"] > 0
+
+
+def test_pullback_gate_keeps_a_long_bought_in_the_bottom_quarter():
+    kwargs = _strong_long_kwargs(close=103.0, ema20=100.0, day_high=112.0)
+    kwargs["indicators"]["day_low"] = 102.0          # close sits 10% up the range
+    result = score_ticker(**kwargs)
+    assert result["trade_signal"] == "STRONG_BUY"
+    assert result["entry_range_pos"] == -0.8
+
+
+def test_pullback_gate_fails_closed_without_a_day_range():
+    kwargs = _strong_long_kwargs(close=103.0, ema20=100.0, day_high=102.0)
+    kwargs["indicators"]["day_low"] = kwargs["indicators"]["day_high"]
+    result = score_ticker(**kwargs)
+    assert result["trade_signal"] == "WATCH_ONLY"
+    assert "unknown" in result["signal_reason"]
+
+
+# ── Optional market-regime gate ─────────────────────────────────────────────
+
+def test_market_trend_compares_last_close_with_its_50_day_average():
+    from stocks.signals import market_trend
+    assert market_trend([100.0] * 49 + [101.0]) == "UP"
+    assert market_trend([100.0] * 49 + [99.0]) == "DOWN"
+    assert market_trend([100.0] * 49) is None            # not enough history
+
+
+def test_regime_gate_is_off_unless_enabled():
+    kwargs = _strong_long_kwargs(close=103.0, ema20=100.0, day_high=112.0)
+    kwargs["indicators"]["day_low"] = 102.0
+    assert score_ticker(**kwargs, market_trend="DOWN")["trade_signal"] == "STRONG_BUY"
+    gated = score_ticker(**kwargs, market_trend="DOWN", stand_aside_in_downtrend=True)
+    assert gated["trade_signal"] == "WATCH_ONLY"
+    assert "50-day" in gated["signal_reason"] and gated["suggested_entry"] is None
+    up = score_ticker(**kwargs, market_trend="UP", stand_aside_in_downtrend=True)
+    assert up["trade_signal"] == "STRONG_BUY" and up["market_trend"] == "UP"

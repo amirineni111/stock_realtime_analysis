@@ -9,6 +9,7 @@ the unit tests of each half.
 """
 from __future__ import annotations
 
+import functools
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -87,13 +88,20 @@ class FakeClient:
 def env(tmp_path, monkeypatch):
     """A scan environment pinned to mid-session so the result is time-independent."""
     monkeypatch.setattr(scanner_mod, "_shared_client", FakeClient())
-    monkeypatch.setattr(scanner_mod, "current_market_phase", lambda: "REGULAR")
-    monkeypatch.setattr(scanner_mod, "market_open_today_utc", lambda: OPEN_UTC)
+    monkeypatch.setattr(scanner_mod, "current_market_phase", lambda now=None: "REGULAR")
+    monkeypatch.setattr(scanner_mod, "market_open_today_utc", lambda now=None: OPEN_UTC)
     monkeypatch.setattr(scanner_mod, "opening_range_end_utc",
-                        lambda: OPEN_UTC + timedelta(minutes=30))
+                        lambda now=None: OPEN_UTC + timedelta(minutes=30))
     # Past the opening-chop window, so signals are armed rather than display-only.
-    monkeypatch.setattr(scanner_mod, "minutes_since_open", lambda: 180.0)
-    monkeypatch.setattr(scanner_mod, "minutes_to_close", lambda: 210.0)
+    monkeypatch.setattr(scanner_mod, "minutes_since_open", lambda now=None: 180.0)
+    monkeypatch.setattr(scanner_mod, "minutes_to_close", lambda now=None: 210.0)
+    # The synthetic uptrend closes at its high, which the pullback-entry gate
+    # rightly refuses. These tests are about arming/logging/veto wiring, not that
+    # gate (covered in test_signals), so switch it off to keep them armed.
+    monkeypatch.setattr(
+        scanner_mod, "score_ticker",
+        functools.partial(scanner_mod.score_ticker, max_entry_range_pos=None),
+    )
 
     storage = Storage(tmp_path / "scan.sqlite3")
     settings = AppSettings(db_path=tmp_path / "scan.sqlite3")

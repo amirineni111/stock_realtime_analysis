@@ -115,6 +115,9 @@ def _score(**kwargs) -> dict:
         indicators=_trending_long(), phase="REGULAR",
         minutes_since_open=120.0, minutes_to_close=150.0,
         hourly_direction="LONG", daily_direction="LONG",
+        # These tests exercise the cost/model gates on a momentum long at the day
+        # high, which the pullback-entry gate would otherwise veto first.
+        max_entry_range_pos=None,
     )
     params.update(kwargs)
     return score_ticker(**params)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 import json
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 
 def _macd_magnitude_pts(macd_histogram: float, atr14: Optional[float], macd: Optional[float]) -> float:
@@ -350,6 +350,66 @@ _MIN_STOP_PCT = 0.005
 # signal downgrades to WATCH_ONLY until price pulls back.
 _MAX_EXTENSION_ATR = 2.0
 
+# Pullback-entry gate: an actionable signal must be entered from the *adverse*
+# side of the day's range — a long from the bottom quarter, a short from the top
+# quarter. Position is measured as the features' ``range_pos_dir``:
+# (pos_in_range − 0.5) × 2 × direction, so −1 = at the day's worst price for the
+# trade, +1 = at its best, and −0.5 is the quarter line.
+#
+# Evidence (Sep 2026). Live forward test, 1,645 trades: the rules as they stood
+# made −0.06R/trade, and no score, tier or feature separated winners from losers
+# (every AUC 0.46–0.52; the shadow model 0.48). What little signal existed pointed
+# *against* the momentum the score rewards: chasing lost, buying weakness won.
+# The replay (scripts/backtest.py, 60 sessions × 34 tickers, same code path)
+# reproduced the live baseline (−0.063R over 3,160 trades) and showed this
+# filter at +0.080R over 553 trades, positive in every third of the window, at
+# 1.0R/1.5R/2.0R targets, across all 34 tickers; the matching live bucket was
+# +0.054R over 200 trades. Chosen from ~60 buckets tested.
+#
+# Two-year check (Polygon history, Nov 2024–Sep 2026, 4,381 trades): about
+# breakeven, −0.010R ± 0.015, versus −0.046R for the ungated rules. It lost money
+# in each of the five quarters to 2025 Q4 and made money in the last three, so the
+# 60-day result was a favourable regime, not a proven edge. It is kept because it
+# cuts losses about 4× on ~6× fewer trades, not because it makes money — see
+# README. None disables the gate.
+_MAX_ENTRY_RANGE_POS: Optional[float] = -0.5
+
+
+# Market-regime gate (opt-in via STOCKS_MARKET_REGIME_GATE): no new trades while
+# SPY's last completed daily close is below its 50-day average. Two-year replay
+# (Nov 2024–Sep 2026, 24,572 ungated trades): in that regime longs averaged
+# −0.069R and shorts −0.085R, versus −0.041R / −0.026R above it, worse in both
+# halves and both directions (t ≈ 3.4). It is not a direction call: weak, choppy
+# markets hurt these setups either way. It cuts losses and does not create an
+# edge (trades above the average still lose), hence opt-in.
+_MARKET_TREND_SMA = 50
+
+
+def market_trend(daily_closes: Sequence[float], period: int = _MARKET_TREND_SMA) -> Optional[str]:
+    """"UP"/"DOWN" for the last close vs its ``period``-day average (completed days
+    only; the caller must not pass today's forming bar). None without enough data."""
+    if len(daily_closes) < period:
+        return None
+    sma = sum(daily_closes[-period:]) / period
+    last = daily_closes[-1]
+    return "UP" if last > sma else ("DOWN" if last < sma else None)
+
+
+def entry_range_pos(
+    close: Optional[float],
+    day_high: Optional[float],
+    day_low: Optional[float],
+    direction: str,
+) -> Optional[float]:
+    """Where ``close`` sits in the day's range, oriented to the trade (−1 worst → +1 best)."""
+    if direction not in ("LONG", "SHORT") or close is None or day_high is None or day_low is None:
+        return None
+    if day_high <= day_low:
+        return None
+    pos = (close - day_low) / (day_high - day_low)
+    d = 1.0 if direction == "LONG" else -1.0
+    return round(max(-2.0, min(2.0, (pos - 0.5) * 2.0 * d)), 3)
+
 # Forward-testing a target under this % of entry is untradeable noise after
 # commissions/slippage (replaces the forex 3×spread thin-edge gate).
 MIN_TARGET_PCT = 0.15
@@ -465,6 +525,9 @@ def score_ticker(
     sr_levels: Optional[list] = None,
     model_prob: Optional[float] = None,
     strength_bonus: float = 0.0,
+    max_entry_range_pos: Optional[float] = _MAX_ENTRY_RANGE_POS,
+    market_trend: Optional[str] = None,
+    stand_aside_in_downtrend: bool = False,
 ) -> dict:
     """
     Compute all signal scores and produce final trade_signal.
@@ -637,6 +700,34 @@ def score_ticker(
             trade_signal = "WATCH_ONLY"
             reason = f"Extended {abs(extension_atr):.1f}×ATR below EMA20 — wait for pullback"
 
+    # Pullback-entry gate (see _MAX_ENTRY_RANGE_POS). An unknown range fails
+    # closed: the evidence is for entries known to be on the adverse side.
+    range_pos = entry_range_pos(close, day_high, day_low, dominant)
+    if (
+        max_entry_range_pos is not None
+        and trade_signal in ("STRONG_BUY", "BUY_CANDIDATE", "STRONG_SHORT", "SHORT_CANDIDATE")
+        and (range_pos is None or range_pos > max_entry_range_pos)
+    ):
+        quarter = "bottom" if dominant == "LONG" else "top"
+        where = "unknown" if range_pos is None else f"{range_pos:+.2f}"
+        trade_signal = "WATCH_ONLY"
+        reason = (
+            f"{dominant} setup ({total:.0f}pts) — wait for a pullback into the {quarter} "
+            f"quarter of the day's range (now {where}, need ≤{max_entry_range_pos:+.2f})"
+        )
+
+    # Market-regime gate (optional, see _MARKET_TREND_SMA).
+    if (
+        stand_aside_in_downtrend
+        and market_trend == "DOWN"
+        and trade_signal in ("STRONG_BUY", "BUY_CANDIDATE", "STRONG_SHORT", "SHORT_CANDIDATE")
+    ):
+        trade_signal = "WATCH_ONLY"
+        reason = (
+            f"{dominant} setup ({total:.0f}pts) — SPY below its {_MARKET_TREND_SMA}-day "
+            f"average: standing aside"
+        )
+
     if model_prob is not None and trade_signal not in ("AVOID", "WATCH_ONLY"):
         reason += f" — P(win) {model_prob:.0%} vs {required_p:.0%} needed"
 
@@ -682,6 +773,8 @@ def score_ticker(
         "nearest_resistance": nearest_resistance,
         "sr_levels_json": json.dumps(sr_levels[:5]) if sr_levels else None,
         "extension_atr": extension_atr,
+        "entry_range_pos": range_pos,
+        "market_trend": market_trend,
         "cost_pct": round(cost_pct, 4),
         "cost_ratio": cost_ratio,
         "model_prob": model_prob,

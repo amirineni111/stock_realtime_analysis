@@ -105,7 +105,22 @@ class ScanRequest(BaseModel):
     signal_mode: str = "All"
 
 
+class ArmedSignal(BaseModel):
+    """A signal this scan newly armed for tracking — i.e. something to alert on."""
+    tracking_id: int
+    ticker: str
+    signal: str
+    entry: Optional[float] = None
+    stop: Optional[float] = None
+    target: Optional[float] = None
+    rr_ratio: Optional[float] = None
+    total_score: float = 0.0
+    reason: str = ""
+    as_of: str = ""
+
+
 class ScanSummary(BaseModel):
     tickers_scanned: int = 0
     errors: int = 0
     signals_found: int = 0
+    armed: List[ArmedSignal] = []

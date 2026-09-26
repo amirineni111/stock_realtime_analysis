@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
+from stocks.alerts import format_alert, notify
 from stocks.config import get_settings
 from stocks.features import FEATURE_VERSION
 from stocks.indices import INDEX_SYMBOLS
@@ -649,6 +650,12 @@ def _page_scanner(
                     f"Scan complete — {summary.tickers_scanned} tickers, "
                     f"{summary.signals_found} signals, {summary.errors} errors"
                 )
+                # New-signal alerts: a toast here, plus a push if a webhook is set.
+                for sig in summary.armed:
+                    st.toast(format_alert(sig)[0], icon="🔔")
+                push_errors = notify(summary.armed, settings.alert_webhook_url)
+                if push_errors:
+                    st.warning("Alert push failed: " + "; ".join(push_errors))
             except Exception as exc:
                 st.error(f"Scan failed: {exc}")
 

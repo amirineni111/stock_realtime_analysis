@@ -1,8 +1,9 @@
 from __future__ import annotations
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 from .config import AppSettings
-from .models import StockBar, StockQuote, StockSnapshot, ScanRequest, ScanSummary
+from .models import ArmedSignal, StockBar, StockQuote, StockSnapshot, ScanRequest, ScanSummary
 from .yf_client import YFClient, DataFetchError
 from .storage import Storage
 from .tickers import BENCHMARK
@@ -13,7 +14,7 @@ from .indicators import (
     range_high_low,
     window_high_low,
 )
-from .signals import score_ticker, MIN_TARGET_PCT
+from .signals import market_trend, score_ticker, MIN_TARGET_PCT
 from .features import build_features, FEATURE_VERSION
 from .market_hours import (
     current_market_phase,
@@ -75,6 +76,180 @@ def _load_model(storage: Storage, shadow: bool = False):
         return None
 
 
+def spy_day_change(spy_5m: List[dict], spy_1d: List[dict]) -> Optional[float]:
+    """SPY's change vs its previous session close — the relative-strength anchor."""
+    if not spy_5m or not spy_1d:
+        return None
+    spy_prev = _prev_session_close(spy_1d, spy_5m[-1]["timestamp"])
+    if not spy_prev:
+        return None
+    return round((spy_5m[-1]["close"] - spy_prev) / spy_prev * 100, 3)
+
+
+def analyze_ticker(
+    ticker: str,
+    bar_dicts: List[dict],
+    h1_dicts: List[dict],
+    d1_dicts: List[dict],
+    spy_change_pct: Optional[float],
+    min_avg_dollar_volume: float,
+    now: Optional[datetime] = None,
+    model=None,
+    shadow_model=None,
+    signal_params: Optional[dict] = None,
+) -> dict:
+    """
+    Everything the scanner decides about one ticker, from bars alone.
+
+    Pure with respect to I/O: no fetching, no storage, and the clock comes in as
+    ``now`` (None = wall clock). That is what lets ``stocks.backtest`` replay history
+    through exactly the code that runs live — a backtest of a re-implementation
+    only tests the re-implementation.
+
+    ``signal_params`` is forwarded to ``score_ticker`` (e.g. a different
+    ``max_entry_range_pos``) so the backtester can compare rule variants.
+
+    Returns {"indicators", "scoring", "features", "context", "model_error"}.
+    """
+    phase = current_market_phase(now)
+    open_utc = market_open_today_utc(now)
+    or_end_utc = opening_range_end_utc(now)
+    mins_open = minutes_since_open(now)
+    mins_close = minutes_to_close(now)
+
+    indicators = compute_all(bar_dicts)
+    as_of = bar_dicts[-1]["timestamp"]
+    last = indicators.get("close")
+
+    # Day range since the 09:30 open, EXCLUDING the current bar so its own
+    # extreme can actually be "broken". Falls back to a rolling 4h window
+    # (48 5m bars) outside market hours or when no session bars exist yet.
+    prior_dicts = bar_dicts[:-1] if len(bar_dicts) > 1 else bar_dicts
+    day_high, day_low = range_high_low(prior_dicts, open_utc)
+    if day_high is None or day_low is None:
+        recent = prior_dicts[-48:] if len(prior_dicts) >= 48 else prior_dicts
+        day_high = max(b["high"] for b in recent)
+        day_low = min(b["low"] for b in recent)
+    or_high, or_low = window_high_low(bar_dicts, open_utc, or_end_utc)
+    indicators["day_high"] = day_high
+    indicators["day_low"] = day_low
+    indicators["or_high"] = or_high
+    indicators["or_low"] = or_low
+
+    hourly_direction = compute_trend_direction(h1_dicts) if h1_dicts else None
+    daily_direction = compute_trend_direction(d1_dicts) if d1_dicts else None
+
+    # Replace the noisy 5-min "day change" with change vs the previous
+    # session's daily close — this also drives relative strength vs SPY.
+    prev_close = _prev_session_close(d1_dicts, as_of)
+    if prev_close and last:
+        indicators["day_change_pct"] = round((last - prev_close) / prev_close * 100, 3)
+
+    avg_dollar_volume = _avg_dollar_volume(d1_dicts)
+
+    # S/R levels from daily (longer-term structure) + hourly (shorter-term)
+    sr_levels: List[dict] = []
+    if d1_dicts:
+        sr_levels += detect_sr_levels(d1_dicts, lookback=50)
+    if h1_dicts:
+        sr_levels += detect_sr_levels(h1_dicts, lookback=30)
+    sr_levels.sort(key=lambda x: x["strength"], reverse=True)
+
+    # Relative strength vs SPY. Folded into the score (rather than added
+    # afterwards) so the number that drives the decision, the number shown
+    # on the dashboard, and the number the model trains on are all the same.
+    rs = calculate_rs(indicators.get("day_change_pct"), spy_change_pct)
+    assessment = rs_assessment(rs)
+
+    def _score(prob: Optional[float], bonus: float) -> dict:
+        return score_ticker(
+            ticker=ticker,
+            last=last,
+            avg_dollar_volume=avg_dollar_volume,
+            indicators=indicators,
+            phase=phase,
+            minutes_since_open=mins_open,
+            minutes_to_close=mins_close,
+            min_avg_dollar_volume=min_avg_dollar_volume,
+            hourly_direction=hourly_direction,
+            daily_direction=daily_direction,
+            sr_levels=sr_levels,
+            model_prob=prob,
+            strength_bonus=bonus,
+            **(signal_params or {}),
+        )
+
+    # RS alignment is judged against the raw directional read, not against
+    # the first-pass label — a countertrend setup downgraded to WATCH_ONLY
+    # still has a direction, and keying off the label would silently zero
+    # the bonus.
+    base = _score(None, 0.0)
+    dom = base.get("dominant")
+    bonus = rs_bonus(
+        assessment,
+        "STRONG_BUY" if dom == "LONG" else ("STRONG_SHORT" if dom == "SHORT" else "WATCH_ONLY"),
+    )
+    scoring = _score(None, bonus) if bonus else base
+
+    # Features are built for every directional setup whether or not a model
+    # exists yet. Building them only when a model was loaded would deadlock
+    # the loop: no model means no logged features, which means no training
+    # data, which means a model can never be trained.
+    feats: Optional[dict] = None
+    model_error: Optional[str] = None
+    if scoring.get("dominant") in ("LONG", "SHORT"):
+        direction = 1 if scoring["dominant"] == "LONG" else -1
+        feat_snap = {
+            **indicators, **scoring,
+            "stop_pct": scoring.get("prov_stop_pct"),
+            "hourly_direction": hourly_direction,
+            "daily_direction": daily_direction,
+            "avg_dollar_volume": avg_dollar_volume,
+            "rs_vs_spy": rs,
+            "as_of": as_of,
+        }
+        feats = build_features(feat_snap, direction)
+
+        scorer = model or shadow_model
+        if scorer is not None:
+            model_prob: Optional[float]
+            try:
+                model_prob = round(scorer.predict_proba(feats), 4)
+            except Exception as exc:
+                model_error = f"Model scoring failed: {exc}"
+                model_prob = None
+            if model_prob is not None:
+                if model is not None:
+                    scoring = _score(model_prob, bonus)
+                else:
+                    # Shadow: record the probability and the bar it would have
+                    # had to clear, but leave trade_signal exactly as the rules
+                    # set it. Rescoring here would re-introduce the veto by the
+                    # back door.
+                    scoring = {**scoring, "model_prob": model_prob}
+
+    return {
+        "indicators": indicators,
+        "scoring": scoring,
+        "features": feats,
+        "model_error": model_error,
+        "context": {
+            "as_of": as_of,
+            "last": last,
+            "prev_close": prev_close,
+            "avg_dollar_volume": avg_dollar_volume,
+            "day_high": day_high,
+            "day_low": day_low,
+            "or_high": or_high,
+            "or_low": or_low,
+            "hourly_direction": hourly_direction,
+            "daily_direction": daily_direction,
+            "rs": rs,
+            "assessment": assessment,
+        },
+    }
+
+
 def run_scan(
     settings: AppSettings,
     storage: Storage,
@@ -100,20 +275,18 @@ def run_scan(
     bars_1d = _fetch("1d")
 
     phase = current_market_phase()
-    open_utc = market_open_today_utc()
-    or_end_utc = opening_range_end_utc()
     mins_open = minutes_since_open()
-    mins_close = minutes_to_close()
 
     # SPY day change anchors the relative-strength post-pass.
-    spy_change_pct: Optional[float] = None
-    spy_5m = bars_5m.get(BENCHMARK) or []
-    spy_1d = [b.model_dump() for b in (bars_1d.get(BENCHMARK) or [])]
-    if spy_5m and spy_1d:
-        spy_last = spy_5m[-1].close
-        spy_prev = _prev_session_close(spy_1d, spy_5m[-1].timestamp)
-        if spy_prev:
-            spy_change_pct = round((spy_last - spy_prev) / spy_prev * 100, 3)
+    spy_change_pct = spy_day_change(
+        [b.model_dump() for b in (bars_5m.get(BENCHMARK) or [])],
+        [b.model_dump() for b in (bars_1d.get(BENCHMARK) or [])],
+    )
+    # Market regime from completed daily bars (the client drops today's forming one).
+    regime_params = {
+        "market_trend": market_trend([b.close for b in (bars_1d.get(BENCHMARK) or [])]),
+        "stand_aside_in_downtrend": settings.market_regime_gate,
+    }
 
     snapshots: List[StockSnapshot] = []
     quotes: List[StockQuote] = []
@@ -139,113 +312,27 @@ def run_scan(
             h1_dicts = [b.model_dump() for b in (bars_1h.get(ticker) or [])]
             d1_dicts = [b.model_dump() for b in (bars_1d.get(ticker) or [])]
 
-            indicators = compute_all(bar_dicts)
-            as_of = bar_dicts[-1]["timestamp"]
-            last = indicators.get("close")
-
-            # Day range since the 09:30 open, EXCLUDING the current bar so its own
-            # extreme can actually be "broken". Falls back to a rolling 4h window
-            # (48 5m bars) outside market hours or when no session bars exist yet.
-            prior_dicts = bar_dicts[:-1] if len(bar_dicts) > 1 else bar_dicts
-            day_high, day_low = range_high_low(prior_dicts, open_utc)
-            if day_high is None or day_low is None:
-                recent = prior_dicts[-48:] if len(prior_dicts) >= 48 else prior_dicts
-                day_high = max(b["high"] for b in recent)
-                day_low = min(b["low"] for b in recent)
-            or_high, or_low = window_high_low(bar_dicts, open_utc, or_end_utc)
-            indicators["day_high"] = day_high
-            indicators["day_low"] = day_low
-            indicators["or_high"] = or_high
-            indicators["or_low"] = or_low
-
-            hourly_direction = compute_trend_direction(h1_dicts) if h1_dicts else None
-            daily_direction = compute_trend_direction(d1_dicts) if d1_dicts else None
-
-            # Replace the noisy 5-min "day change" with change vs the previous
-            # session's daily close — this also drives relative strength vs SPY.
-            prev_close = _prev_session_close(d1_dicts, as_of)
-            if prev_close and last:
-                indicators["day_change_pct"] = round((last - prev_close) / prev_close * 100, 3)
-
-            avg_dollar_volume = _avg_dollar_volume(d1_dicts)
-
-            # S/R levels from daily (longer-term structure) + hourly (shorter-term)
-            sr_levels: List[dict] = []
-            if d1_dicts:
-                sr_levels += detect_sr_levels(d1_dicts, lookback=50)
-            if h1_dicts:
-                sr_levels += detect_sr_levels(h1_dicts, lookback=30)
-            sr_levels.sort(key=lambda x: x["strength"], reverse=True)
-
-            # Relative strength vs SPY. Folded into the score (rather than added
-            # afterwards) so the number that drives the decision, the number shown
-            # on the dashboard, and the number the model trains on are all the same.
-            rs = calculate_rs(indicators.get("day_change_pct"), spy_change_pct)
-            assessment = rs_assessment(rs)
-
-            def _score(prob: Optional[float], bonus: float) -> dict:
-                return score_ticker(
-                    ticker=ticker,
-                    last=last,
-                    avg_dollar_volume=avg_dollar_volume,
-                    indicators=indicators,
-                    phase=phase,
-                    minutes_since_open=mins_open,
-                    minutes_to_close=mins_close,
-                    min_avg_dollar_volume=request.min_avg_dollar_volume,
-                    hourly_direction=hourly_direction,
-                    daily_direction=daily_direction,
-                    sr_levels=sr_levels,
-                    model_prob=prob,
-                    strength_bonus=bonus,
-                )
-
-            # RS alignment is judged against the raw directional read, not against
-            # the first-pass label — a countertrend setup downgraded to WATCH_ONLY
-            # still has a direction, and keying off the label would silently zero
-            # the bonus.
-            base = _score(None, 0.0)
-            dom = base.get("dominant")
-            bonus = rs_bonus(
-                assessment,
-                "STRONG_BUY" if dom == "LONG" else ("STRONG_SHORT" if dom == "SHORT" else "WATCH_ONLY"),
+            result = analyze_ticker(
+                ticker, bar_dicts, h1_dicts, d1_dicts, spy_change_pct,
+                request.min_avg_dollar_volume, model=model, shadow_model=shadow_model,
+                signal_params=regime_params,
             )
-            scoring = _score(None, bonus) if bonus else base
-
-            # Features are built for every directional setup whether or not a model
-            # exists yet. Building them only when a model was loaded would deadlock
-            # the loop: no model means no logged features, which means no training
-            # data, which means a model can never be trained.
-            if scoring.get("dominant") in ("LONG", "SHORT"):
-                direction = 1 if scoring["dominant"] == "LONG" else -1
-                feat_snap = {
-                    **indicators, **scoring,
-                    "stop_pct": scoring.get("prov_stop_pct"),
-                    "hourly_direction": hourly_direction,
-                    "daily_direction": daily_direction,
-                    "avg_dollar_volume": avg_dollar_volume,
-                    "rs_vs_spy": rs,
-                    "as_of": as_of,
-                }
-                feats = build_features(feat_snap, direction)
-                features_by_ticker[ticker] = feats
-
-                scorer = model or shadow_model
-                if scorer is not None:
-                    try:
-                        model_prob = round(scorer.predict_proba(feats), 4)
-                    except Exception as exc:
-                        storage.log_ticker(scan_id, ticker, None, f"Model scoring failed: {exc}")
-                        model_prob = None
-                    if model_prob is not None:
-                        if model is not None:
-                            scoring = _score(model_prob, bonus)
-                        else:
-                            # Shadow: record the probability and the bar it would have
-                            # had to clear, but leave trade_signal exactly as the rules
-                            # set it. Rescoring here would re-introduce the veto by the
-                            # back door.
-                            scoring = {**scoring, "model_prob": model_prob}
+            if result["model_error"]:
+                storage.log_ticker(scan_id, ticker, None, result["model_error"])
+            indicators = result["indicators"]
+            scoring = result["scoring"]
+            ctx = result["context"]
+            if result["features"] is not None:
+                features_by_ticker[ticker] = result["features"]
+            as_of = ctx["as_of"]
+            last = ctx["last"]
+            prev_close = ctx["prev_close"]
+            avg_dollar_volume = ctx["avg_dollar_volume"]
+            day_high, day_low = ctx["day_high"], ctx["day_low"]
+            or_high, or_low = ctx["or_high"], ctx["or_low"]
+            hourly_direction = ctx["hourly_direction"]
+            daily_direction = ctx["daily_direction"]
+            rs, assessment = ctx["rs"], ctx["assessment"]
 
             snapshot = StockSnapshot(
                 ticker=ticker,
@@ -373,7 +460,7 @@ def run_scan(
         ):
             direction = -1 if "SHORT" in s.trade_signal else 1
             try:
-                storage.record_tracked_signal(
+                tracking_id = storage.record_tracked_signal(
                     ticker=s.ticker,
                     signal=s.trade_signal,
                     direction=direction,
@@ -402,6 +489,20 @@ def run_scan(
                         else ("shadow" if shadow_model is not None else None)
                     ),
                 )
+                # A None id means dedupe/cooldown suppressed it — already alerted.
+                if tracking_id is not None:
+                    summary.armed.append(ArmedSignal(
+                        tracking_id=tracking_id,
+                        ticker=s.ticker,
+                        signal=s.trade_signal,
+                        entry=s.suggested_entry,
+                        stop=s.suggested_stop,
+                        target=s.suggested_target,
+                        rr_ratio=s.rr_ratio,
+                        total_score=s.total_score,
+                        reason=s.signal_reason,
+                        as_of=s.as_of,
+                    ))
             except Exception as exc:
                 storage.log_ticker(scan_id, s.ticker, None, f"Tracking record failed: {exc}")
 
