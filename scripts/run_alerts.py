@@ -29,7 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from stocks.alerts import console_line, notify, send  # noqa: E402
+from stocks.alerts import channel_name, console_line, deliver, notify, send  # noqa: E402
 from stocks.config import get_settings  # noqa: E402
 from stocks.market_hours import US_EASTERN, current_market_phase  # noqa: E402
 from stocks.models import ArmedSignal, ScanRequest  # noqa: E402
@@ -58,7 +58,7 @@ def next_wake(now: datetime, lag_seconds: float) -> datetime:
     return wake
 
 
-def _scan_once(settings, storage, request, quiet: bool) -> None:
+def _scan_once(settings, storage, request, url: str, quiet: bool) -> None:
     summary = run_scan(settings, storage, request)
     stamp = datetime.now(US_EASTERN).strftime("%H:%M:%S")
     if not quiet or summary.armed:
@@ -67,7 +67,7 @@ def _scan_once(settings, storage, request, quiet: bool) -> None:
               f"{summary.errors} errors", flush=True)
     for sig in summary.armed:
         print("  " + console_line(sig), flush=True)
-    for err in notify(summary.armed, settings.alert_webhook_url):
+    for err in deliver(summary.armed, url, storage, "runner"):
         print(f"  push failed - {err}", flush=True)
 
 
@@ -89,8 +89,10 @@ def main() -> int:
     args = ap.parse_args()
 
     settings = get_settings()
+    # .env wins; otherwise use the URL entered in the dashboard sidebar.
+    url = settings.alert_webhook_url or (prefs.get("alert_webhook") or "").strip()
     if args.sample_alert:
-        if not settings.alert_webhook_url:
+        if not url:
             print("STOCKS_ALERT_WEBHOOK_URL is not set (see .env.example).")
             return 1
         sample = ArmedSignal(
@@ -99,15 +101,15 @@ def main() -> int:
             reason="SAMPLE ALERT - not a real signal. Real alerts look exactly like this.",
             as_of=datetime.now(timezone.utc).isoformat(),
         )
-        errors = notify([sample], settings.alert_webhook_url)
+        errors = notify([sample], url)
         print("sent" if not errors else f"failed: {errors}")
         return 0 if not errors else 1
 
     if args.test_push:
-        if not settings.alert_webhook_url:
+        if not url:
             print("STOCKS_ALERT_WEBHOOK_URL is not set (see .env.example).")
             return 1
-        err = send(settings.alert_webhook_url, "Stock scanner test alert",
+        err = send(url, "Stock scanner test alert",
                    "If you can read this, push alerts are working.")
         print("sent" if err is None else f"failed: {err}")
         return 0 if err is None else 1
@@ -119,11 +121,11 @@ def main() -> int:
 
     storage = Storage(settings.db_path)
     request = ScanRequest(tickers=tickers, min_avg_dollar_volume=args.min_dollar_volume_m * 1_000_000)
-    push = "push -> webhook" if settings.alert_webhook_url else "console only (no STOCKS_ALERT_WEBHOOK_URL)"
+    push = f"push -> {channel_name(url)}" if url else "console only (no STOCKS_ALERT_WEBHOOK_URL)"
     print(f"Watching {len(tickers)} tickers; {push}. Ctrl+C to stop.", flush=True)
 
     if args.once:
-        _scan_once(settings, storage, request, quiet=False)
+        _scan_once(settings, storage, request, url, quiet=False)
         return 0
 
     try:
@@ -134,7 +136,7 @@ def main() -> int:
             if not args.offhours and current_market_phase() != "REGULAR":
                 continue
             try:
-                _scan_once(settings, storage, request, args.quiet)
+                _scan_once(settings, storage, request, url, args.quiet)
             except Exception as exc:  # keep the loop alive through network blips
                 print(f"[{datetime.now(US_EASTERN):%H:%M:%S}] scan failed: {exc}", flush=True)
     except KeyboardInterrupt:

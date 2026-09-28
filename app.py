@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-from stocks.alerts import format_alert, notify
+from stocks.alerts import channel_name, deliver, format_alert
 from stocks.config import get_settings
 from stocks.features import FEATURE_VERSION
 from stocks.indices import INDEX_SYMBOLS
@@ -59,6 +59,8 @@ def _init_state() -> None:
         "auto_refresh": prefs.get("auto_refresh", False),
         "refresh_seconds": prefs.get("refresh_seconds", 60),
         "allow_offhours": prefs.get("allow_offhours", False),
+        "alerts_enabled": prefs.get("alerts_enabled", True),
+        "alert_webhook": prefs.get("alert_webhook", ""),
         "auto_refresh_count_last": 0,
         "quotes_auto_refresh_count_last": 0,
         "paper_dialog_open": False,
@@ -518,6 +520,73 @@ def _render_trade_actions(storage: Storage, sel) -> None:
     )
 
 
+# ── Alerts ───────────────────────────────────────────────────────────────────
+
+def _push_url() -> str:
+    """This session's push URL: the sidebar override, else STOCKS_ALERT_WEBHOOK_URL."""
+    if not st.session_state.get("alerts_enabled", True):
+        return ""
+    return (st.session_state.get("alert_webhook") or "").strip() or get_settings().alert_webhook_url
+
+
+def _render_alerts_tab(storage: Storage) -> None:
+    st.subheader("Alerts")
+    st.caption(
+        "Every newly armed signal, from this dashboard or the headless runner "
+        "(scripts/run_alerts.py), with its push outcome. Each setup alerts once — "
+        "arming dedupes one open signal per ticker+direction with a 45-minute re-arm cooldown."
+    )
+    window = st.selectbox(
+        "Window", [("Last 24 hours", 1440), ("Last 3 days", 4320),
+                   ("Last week", 10080), ("Everything", None)],
+        format_func=lambda opt: opt[0], index=0, key="alerts_window",
+    )
+    rows = storage.load_alerts(limit=500, since_minutes=window[1])
+    if not rows:
+        st.info("No alerts in this window. Alerts are logged from the first scan that "
+                "arms a signal after this update.")
+        return
+
+    failed = [r for r in rows if r["delivery_error"]]
+    if failed:
+        st.warning(
+            f"{len(failed)} alert(s) failed push delivery — listed below regardless. "
+            f"Most recent error: {failed[0]['delivery_error']}"
+        )
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Alerts", len(rows))
+    c2.metric("Pushed", sum(1 for r in rows if r["delivered"]))
+    c3.metric("Failed", len(failed))
+
+    df = pd.DataFrame(rows)
+    df["When"] = pd.to_datetime(df["created_at"], errors="coerce", utc=True).dt.tz_convert("America/New_York")
+    df["Side"] = df["direction"].map(lambda d: "LONG" if d and d > 0 else "SHORT")
+    df["Signal"] = df["signal"].map(_signal_badge)
+    df["Push"] = [
+        "✅ " + (r["channel"] or "") if r["delivered"]
+        else (f"❌ {r['delivery_error']}" if r["delivery_error"] else "— not pushed")
+        for r in rows
+    ]
+    view = df[[
+        "When", "ticker", "Side", "Signal", "entry", "stop", "target", "rr_ratio",
+        "total_score", "Push", "source", "reason",
+    ]].rename(columns={
+        "ticker": "Ticker", "entry": "Entry", "stop": "Stop", "target": "Target",
+        "rr_ratio": "R:R", "total_score": "Score", "source": "Source", "reason": "Reason",
+    })
+    st.dataframe(
+        view, use_container_width=True, hide_index=True,
+        column_config={
+            "When": st.column_config.DatetimeColumn("When (ET)", format="MMM DD HH:mm"),
+            "Entry": st.column_config.NumberColumn(format="%.2f"),
+            "Stop": st.column_config.NumberColumn(format="%.2f"),
+            "Target": st.column_config.NumberColumn(format="%.2f"),
+            "R:R": st.column_config.NumberColumn(format="%.1f"),
+            "Score": st.column_config.NumberColumn(format="%.0f"),
+        },
+    )
+
+
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 
 def _render_sidebar() -> tuple:
@@ -584,12 +653,41 @@ def _render_sidebar() -> tuple:
     st.session_state.refresh_seconds = refresh_secs
     st.session_state.allow_offhours = allow_offhours
 
+    st.sidebar.divider()
+
+    # Alerts
+    st.sidebar.subheader("Alerts")
+    alerts_enabled = st.sidebar.checkbox(
+        "Push alerts on new signals",
+        value=st.session_state.alerts_enabled,
+        help="Each newly armed signal is pushed once. Off = dashboard toasts and the "
+             "Alerts tab only. The headless runner (start_nasdaq_alerts.bat) pushes "
+             "regardless, but a signal this dashboard armed while off is not re-pushed.",
+    )
+    webhook_url = st.sidebar.text_input(
+        "Webhook URL (optional)",
+        value=st.session_state.alert_webhook,
+        type="password",
+        placeholder="https://ntfy.sh/your-private-topic",
+        help="ntfy topic URL (phone push via the ntfy app), Slack, Discord or any "
+             "endpoint accepting JSON. Blank = STOCKS_ALERT_WEBHOOK_URL from .env.",
+    )
+    st.session_state.alerts_enabled = alerts_enabled
+    st.session_state.alert_webhook = webhook_url
+    push_url = _push_url()
+    st.sidebar.caption(
+        f"Pushing to: {channel_name(push_url)}" if push_url
+        else "No push URL — dashboard alerts only."
+    )
+
     _save_prefs({
         "watchlist_raw": watchlist_raw,
         "min_dollar_volume_m": min_dollar_volume_m,
         "auto_refresh": auto_refresh,
         "refresh_seconds": refresh_secs,
         "allow_offhours": allow_offhours,
+        "alerts_enabled": alerts_enabled,
+        "alert_webhook": webhook_url,
     })
 
     return selected_tickers, min_dollar_volume_m * 1_000_000, signal_mode, auto_refresh, refresh_secs, allow_offhours, phase
@@ -653,7 +751,7 @@ def _page_scanner(
                 # New-signal alerts: a toast here, plus a push if a webhook is set.
                 for sig in summary.armed:
                     st.toast(format_alert(sig)[0], icon="🔔")
-                push_errors = notify(summary.armed, settings.alert_webhook_url)
+                push_errors = deliver(summary.armed, _push_url(), storage, "dashboard")
                 if push_errors:
                     st.warning("Alert push failed: " + "; ".join(push_errors))
             except Exception as exc:
@@ -664,10 +762,14 @@ def _page_scanner(
         st.success(st.session_state.paper_flash)
         st.session_state.paper_flash = ""
 
-    (tab_results, tab_paper, tab_watchlist, tab_perf,
+    (tab_results, tab_alerts, tab_paper, tab_watchlist, tab_perf,
      tab_model, tab_logs, tab_settings) = st.tabs(
-        ["Results", "Paper Trades", "Watchlist", "Performance", "Model", "Scan Logs", "Settings"]
+        ["Results", "Alerts", "Paper Trades", "Watchlist", "Performance", "Model",
+         "Scan Logs", "Settings"]
     )
+
+    with tab_alerts:
+        _render_alerts_tab(storage)
 
     # ── Results tab ──────────────────────────────────────────────────────────
     with tab_results:

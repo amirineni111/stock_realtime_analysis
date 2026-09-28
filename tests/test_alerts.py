@@ -61,3 +61,35 @@ def test_next_wake_lands_just_after_the_next_bar_close():
     # Inside the lag window of the bar that just closed: wake for that bar.
     early = datetime(2026, 9, 24, 18, 35, 30, tzinfo=timezone.utc)
     assert next_wake(early, 75) == datetime(2026, 9, 24, 18, 36, 15, tzinfo=timezone.utc)
+
+
+def test_deliver_logs_every_alert_with_its_push_outcome(tmp_path):
+    from stocks.alerts import deliver
+    from stocks.storage import Storage
+
+    storage = Storage(tmp_path / "t.sqlite3")
+    short = SIG.model_copy(update={"tracking_id": 2, "ticker": "TSLA", "signal": "SHORT_CANDIDATE"})
+    errors = deliver([SIG, short], "http://127.0.0.1:9/ntfy-down", storage, "runner")
+    assert len(errors) == 2
+    rows = storage.load_alerts()
+    assert {r["ticker"] for r in rows} == {"NVDA", "TSLA"}
+    assert all(r["delivered"] == 0 and r["delivery_error"] for r in rows)
+    assert {r["direction"] for r in rows} == {1, -1}
+
+    # No URL: still logged (the Alerts tab shows it), just not pushed. A repeat of
+    # the same tracking_id (dashboard and runner racing) is not logged twice.
+    third = SIG.model_copy(update={"tracking_id": 3})
+    assert deliver([third, SIG], "", storage, "dashboard") == []
+    rows = storage.load_alerts()
+    assert len(rows) == 3
+    new = next(r for r in rows if r["tracking_id"] == 3)
+    assert new["channel"] is None and new["delivered"] == 0 and new["delivery_error"] is None
+
+
+def test_channel_name_matches_request_routing():
+    from stocks.alerts import channel_name
+    assert channel_name("https://ntfy.sh/x") == "ntfy"
+    assert channel_name("https://discord.com/api/webhooks/1/x") == "discord"
+    assert channel_name("https://hooks.slack.com/services/x") == "slack"
+    assert channel_name("https://example.com/hook") == "webhook"
+    assert channel_name("") is None

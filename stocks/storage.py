@@ -306,6 +306,32 @@ class Storage:
                     ON stock_paper_positions(status, ticker);
                 CREATE INDEX IF NOT EXISTS idx_stock_paper_fills_pos
                     ON stock_paper_fills(position_id);
+
+                -- One row per alert raised: every newly armed signal, whether or not
+                -- a push went out. Delivery status lives here so a dead webhook is
+                -- visible in the Alerts tab instead of silently losing signals.
+                -- Dedupe is inherited from arming (one row per tracking_id).
+                CREATE TABLE IF NOT EXISTS stock_alerts (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at     TEXT DEFAULT CURRENT_TIMESTAMP,
+                    tracking_id    INTEGER UNIQUE,
+                    ticker         TEXT NOT NULL,
+                    signal         TEXT,
+                    direction      INTEGER,
+                    entry          REAL,
+                    stop           REAL,
+                    target         REAL,
+                    rr_ratio       REAL,
+                    total_score    REAL,
+                    reason         TEXT,
+                    as_of          TEXT,
+                    source         TEXT,
+                    channel        TEXT,
+                    delivered      INTEGER DEFAULT 0,
+                    delivery_error TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_stock_alerts_created
+                    ON stock_alerts(created_at);
             """)
 
     # ── Scan run lifecycle ──────────────────────────────────────────────────
@@ -948,6 +974,35 @@ class Storage:
                 "ORDER BY created_at DESC LIMIT ?", (status, limit),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── Alerts ──────────────────────────────────────────────────────────────
+
+    def record_alert(self, sig, source: str, channel: Optional[str],
+                     error: Optional[str]) -> None:
+        """Log one alert and its push outcome. ``channel`` None = no push URL set."""
+        direction = -1 if "SHORT" in sig.signal else 1
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO stock_alerts "
+                "(tracking_id,ticker,signal,direction,entry,stop,target,rr_ratio,"
+                " total_score,reason,as_of,source,channel,delivered,delivery_error) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (sig.tracking_id, sig.ticker, sig.signal, direction, sig.entry, sig.stop,
+                 sig.target, sig.rr_ratio, sig.total_score, sig.reason, sig.as_of,
+                 source, channel, int(channel is not None and error is None), error),
+            )
+
+    def load_alerts(self, limit: int = 200, since_minutes: Optional[int] = None) -> list:
+        """Most recent alerts first. ``since_minutes`` restricts to a recent window."""
+        sql = "SELECT * FROM stock_alerts"
+        params: list = []
+        if since_minutes is not None:
+            sql += " WHERE created_at >= datetime('now', ?)"
+            params.append(f"-{int(since_minutes)} minutes")
+        sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
     # ── Model store / training data ─────────────────────────────────────────
 

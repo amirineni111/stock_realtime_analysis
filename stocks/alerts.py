@@ -92,27 +92,62 @@ def send(url: str, title: str, body: str, sig: Optional[ArmedSignal] = None) -> 
     return None
 
 
+def channel_name(url: str) -> Optional[str]:
+    """Which service ``url`` points at, for the alert log. None when no URL is set."""
+    if not url:
+        return None
+    host = urlparse(url).netloc.lower()
+    for key, name in (("ntfy", "ntfy"), ("discord", "discord"), ("hooks.slack.com", "slack")):
+        if key in host:
+            return name
+    return "webhook"
+
+
+def push_each(armed: Sequence[ArmedSignal], url: str) -> List[Tuple[ArmedSignal, Optional[str]]]:
+    """
+    Push every newly armed signal to ``url``; returns (signal, error-or-None) per
+    signal. Signals past the per-scan cap share the summary message's outcome.
+    """
+    if not url or not armed:
+        return []
+    results: List[Tuple[ArmedSignal, Optional[str]]] = []
+    head, rest = list(armed[:_MAX_MESSAGES_PER_SCAN]), list(armed[_MAX_MESSAGES_PER_SCAN:])
+    for sig in head:
+        title, body = format_alert(sig)
+        results.append((sig, send(url, title, body, sig)))
+    if rest:
+        title = f"+{len(rest)} more signals"
+        body = ", ".join(f"{s.ticker} {_ARROW.get(s.signal, s.signal)}" for s in rest)
+        err = send(url, title, body)
+        results.extend((s, err) for s in rest)
+    return results
+
+
 def notify(armed: Sequence[ArmedSignal], url: str) -> List[str]:
     """
     Push every newly armed signal to ``url``. Returns the list of delivery errors
     (empty = all delivered, or nothing to send / no URL configured).
     """
-    if not url or not armed:
+    return [f"{sig.ticker}: {err}" for sig, err in push_each(armed, url) if err]
+
+
+def deliver(armed: Sequence[ArmedSignal], url: str, storage, source: str) -> List[str]:
+    """
+    Push ``armed`` (when ``url`` is set) and log every alert with its outcome to the
+    ``stock_alerts`` table the dashboard's Alerts tab reads. Returns delivery errors.
+    Logging failures are swallowed — like a push failure, they must not break a scan.
+    """
+    if not armed:
         return []
-    errors: List[str] = []
-    head, rest = list(armed[:_MAX_MESSAGES_PER_SCAN]), list(armed[_MAX_MESSAGES_PER_SCAN:])
-    for sig in head:
-        title, body = format_alert(sig)
-        err = send(url, title, body, sig)
-        if err:
-            errors.append(f"{sig.ticker}: {err}")
-    if rest:
-        title = f"+{len(rest)} more signals"
-        body = ", ".join(f"{s.ticker} {_ARROW.get(s.signal, s.signal)}" for s in rest)
-        err = send(url, title, body)
-        if err:
-            errors.append(f"summary: {err}")
-    return errors
+    outcomes = dict((sig.tracking_id, err) for sig, err in push_each(armed, url))
+    channel = channel_name(url)
+    for sig in armed:
+        try:
+            storage.record_alert(sig, source, channel, outcomes.get(sig.tracking_id))
+        except Exception:
+            pass
+    return [f"{sig.ticker}: {outcomes[sig.tracking_id]}"
+            for sig in armed if outcomes.get(sig.tracking_id)]
 
 
 def console_line(sig: ArmedSignal, now: Optional[datetime] = None) -> str:
