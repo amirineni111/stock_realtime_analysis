@@ -567,9 +567,17 @@ def _render_alerts_tab(storage: Storage) -> None:
         else (f"❌ {r['delivery_error']}" if r["delivery_error"] else "— not pushed")
         for r in rows
     ]
+    # Live price per ticker (last close when the market is shut), and the move
+    # since the alert's entry, signed so a favorable move is positive either side.
+    marks = _last_prices(df["ticker"])
+    df["Current"] = df["ticker"].map(lambda t: marks.get(str(t).upper()))
+    df["Move %"] = [
+        (cur - e) / e * 100 * (1 if d and d > 0 else -1) if cur and e else None
+        for cur, e, d in zip(df["Current"], df["entry"], df["direction"])
+    ]
     view = df[[
-        "When", "ticker", "Side", "Signal", "entry", "stop", "target", "rr_ratio",
-        "total_score", "Push", "source", "reason",
+        "When", "ticker", "Side", "Signal", "entry", "stop", "target", "Current",
+        "Move %", "rr_ratio", "total_score", "Push", "source", "reason",
     ]].rename(columns={
         "ticker": "Ticker", "entry": "Entry", "stop": "Stop", "target": "Target",
         "rr_ratio": "R:R", "total_score": "Score", "source": "Source", "reason": "Reason",
@@ -581,6 +589,14 @@ def _render_alerts_tab(storage: Storage) -> None:
             "Entry": st.column_config.NumberColumn(format="%.2f"),
             "Stop": st.column_config.NumberColumn(format="%.2f"),
             "Target": st.column_config.NumberColumn(format="%.2f"),
+            "Current": st.column_config.NumberColumn(
+                format="%.2f",
+                help="Latest price (30s cache); the last close when the market is closed",
+            ),
+            "Move %": st.column_config.NumberColumn(
+                format="%+.2f%%",
+                help="Change from Entry in the alert's favor — positive = working, negative = against",
+            ),
             "R:R": st.column_config.NumberColumn(format="%.1f"),
             "Score": st.column_config.NumberColumn(format="%.0f"),
         },
