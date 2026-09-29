@@ -977,20 +977,53 @@ class Storage:
 
     # ── Alerts ──────────────────────────────────────────────────────────────
 
-    def record_alert(self, sig, source: str, channel: Optional[str],
-                     error: Optional[str]) -> None:
-        """Log one alert and its push outcome. ``channel`` None = no push URL set."""
+    def claim_alert(self, sig, source: str, channel: Optional[str]) -> bool:
+        """
+        Log one alert before it is pushed. Returns False when this tracking_id was
+        already alerted — the dashboard and the runner can both see the same armed
+        signal, and only the process that claims it first may push it.
+        """
         direction = -1 if "SHORT" in sig.signal else 1
         with self._connect() as conn:
-            conn.execute(
+            cur = conn.execute(
                 "INSERT OR IGNORE INTO stock_alerts "
                 "(tracking_id,ticker,signal,direction,entry,stop,target,rr_ratio,"
                 " total_score,reason,as_of,source,channel,delivered,delivery_error) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL)",
                 (sig.tracking_id, sig.ticker, sig.signal, direction, sig.entry, sig.stop,
                  sig.target, sig.rr_ratio, sig.total_score, sig.reason, sig.as_of,
-                 source, channel, int(channel is not None and error is None), error),
+                 source, channel),
             )
+            return cur.rowcount == 1
+
+    def set_alert_delivery(self, tracking_id: int, error: Optional[str]) -> None:
+        """Record the push outcome of a claimed alert."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE stock_alerts SET delivered=?, delivery_error=? WHERE tracking_id=?",
+                (int(error is None), error, tracking_id),
+            )
+
+    def load_unalerted_signals(self, max_age_minutes: int = 60) -> list:
+        """
+        Open tracked signals armed recently that never got an alert row.
+
+        Arming commits before the alert is sent, so a scan cut short in between
+        (a Streamlit rerun stops the script mid-run) leaves an armed trade that the
+        dedupe will never re-arm — and so would never alert. The next scan's
+        delivery sweeps these up. The age limit keeps a restart from pushing trades
+        armed long ago (or before alert logging existed).
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT t.* FROM stock_signal_tracking t "
+                "LEFT JOIN stock_alerts a ON a.tracking_id = t.id "
+                "WHERE t.status='open' AND a.id IS NULL "
+                "  AND t.created_at >= datetime('now', ?) "
+                "ORDER BY t.id",
+                (f"-{int(max_age_minutes)} minutes",),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def load_alerts(self, limit: int = 200, since_minutes: Optional[int] = None) -> list:
         """Most recent alerts first. ``since_minutes`` restricts to a recent window.

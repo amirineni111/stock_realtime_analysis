@@ -93,3 +93,26 @@ def test_channel_name_matches_request_routing():
     assert channel_name("https://hooks.slack.com/services/x") == "slack"
     assert channel_name("https://example.com/hook") == "webhook"
     assert channel_name("") is None
+
+
+def test_deliver_sweeps_up_a_signal_armed_but_never_alerted(tmp_path):
+    """A scan cut off between arming and delivery must still alert on the next one."""
+    from stocks.alerts import deliver
+    from stocks.storage import Storage
+
+    storage = Storage(tmp_path / "t.sqlite3")
+    tid = storage.record_tracked_signal(
+        ticker="COIN", signal="BUY_CANDIDATE", direction=1, entry=300.0, stop=297.0,
+        target=304.5, stop_dollars=3.0, target_dollars=4.5, atr14=2.0,
+        entry_ts="2026-09-28T19:15:00+00:00", total_score=49.0,
+    )
+    # The interrupted scan never called deliver; the next scan armed nothing new.
+    assert deliver([], "", storage, "dashboard") == []
+    rows = storage.load_alerts()
+    assert [r["tracking_id"] for r in rows] == [tid]
+    assert rows[0]["ticker"] == "COIN" and rows[0]["rr_ratio"] == 1.5
+    assert "late alert" in rows[0]["reason"]
+
+    # Already alerted: neither a sweep nor a racing process pushes it again.
+    assert deliver([], "http://127.0.0.1:9/ntfy-down", storage, "runner") == []
+    assert len(storage.load_alerts()) == 1

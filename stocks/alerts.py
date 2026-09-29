@@ -131,23 +131,63 @@ def notify(armed: Sequence[ArmedSignal], url: str) -> List[str]:
     return [f"{sig.ticker}: {err}" for sig, err in push_each(armed, url) if err]
 
 
+def _missed_signal(row: dict) -> ArmedSignal:
+    """An armed-but-never-alerted tracking row, rebuilt as an alert."""
+    armed_at = parse_ts(row.get("created_at"))
+    late = f" | late alert, armed {armed_at.astimezone(US_EASTERN):%H:%M} ET" if armed_at else " | late alert"
+    stop_d, target_d = row.get("stop_dollars"), row.get("target_dollars")
+    score = row.get("total_score") or 0.0
+    return ArmedSignal(
+        tracking_id=row["id"],
+        ticker=row["ticker"],
+        signal=row["signal"],
+        entry=row.get("entry_price"),
+        stop=row.get("stop_price"),
+        target=row.get("target_price"),
+        rr_ratio=(target_d / stop_d) if stop_d and target_d else None,
+        total_score=score,
+        reason=f"{row['signal']} ({score:.0f}pts){late}",
+        as_of=row.get("entry_ts") or "",
+    )
+
+
 def deliver(armed: Sequence[ArmedSignal], url: str, storage, source: str) -> List[str]:
     """
     Push ``armed`` (when ``url`` is set) and log every alert with its outcome to the
     ``stock_alerts`` table the dashboard's Alerts tab reads. Returns delivery errors.
-    Logging failures are swallowed — like a push failure, they must not break a scan.
+
+    Also sweeps up recently armed signals that never got an alert (a scan cut off
+    between arming and delivery). Each alert is claimed in the log before it is
+    pushed, so two processes sweeping at once push it only once. Logging failures
+    are swallowed — like a push failure, they must not break a scan.
     """
-    if not armed:
+    pending = list(armed)
+    try:
+        seen = {s.tracking_id for s in pending}
+        pending += [_missed_signal(r) for r in storage.load_unalerted_signals()
+                    if r["id"] not in seen]
+    except Exception:
+        pass
+    if not pending:
         return []
-    outcomes = dict((sig.tracking_id, err) for sig, err in push_each(armed, url))
     channel = channel_name(url)
-    for sig in armed:
+    claimed = []
+    for sig in pending:
         try:
-            storage.record_alert(sig, source, channel, outcomes.get(sig.tracking_id))
+            if not storage.claim_alert(sig, source, channel):
+                continue   # already alerted by this or another process
         except Exception:
-            pass
+            pass           # can't log it — still better to push than to drop it
+        claimed.append(sig)
+    outcomes = dict((sig.tracking_id, err) for sig, err in push_each(claimed, url))
+    if channel is not None:
+        for sig in claimed:
+            try:
+                storage.set_alert_delivery(sig.tracking_id, outcomes.get(sig.tracking_id))
+            except Exception:
+                pass
     return [f"{sig.ticker}: {outcomes[sig.tracking_id]}"
-            for sig in armed if outcomes.get(sig.tracking_id)]
+            for sig in claimed if outcomes.get(sig.tracking_id)]
 
 
 def console_line(sig: ArmedSignal, now: Optional[datetime] = None) -> str:
