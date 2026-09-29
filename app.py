@@ -536,15 +536,24 @@ def _render_alerts_tab(storage: Storage) -> None:
         "(scripts/run_alerts.py), with its push outcome. Each setup alerts once — "
         "arming dedupes one open signal per ticker+direction with a 45-minute re-arm cooldown."
     )
-    window = st.selectbox(
+    f1, f2 = st.columns(2)
+    window = f1.selectbox(
         "Window", [("Last 24 hours", 1440), ("Last 3 days", 4320),
                    ("Last week", 10080), ("Everything", None)],
         format_func=lambda opt: opt[0], index=0, key="alerts_window",
     )
+    status_filter = f2.selectbox(
+        "Status", ["All", "Open", "Closed"], index=0, key="alerts_status",
+    )
     rows = storage.load_alerts(limit=500, since_minutes=window[1])
+    if status_filter != "All":
+        rows = [r for r in rows if _alert_is_open(r) == (status_filter == "Open")]
     if not rows:
-        st.info("No alerts in this window. Alerts are logged from the first scan that "
-                "arms a signal after this update.")
+        if status_filter != "All":
+            st.info(f"No {status_filter.lower()} alerts in this window.")
+        else:
+            st.info("No alerts in this window. Alerts are logged from the first scan that "
+                    "arms a signal after this update.")
         return
 
     failed = [r for r in rows if r["delivery_error"]]
@@ -553,15 +562,22 @@ def _render_alerts_tab(storage: Storage) -> None:
             f"{len(failed)} alert(s) failed push delivery — listed below regardless. "
             f"Most recent error: {failed[0]['delivery_error']}"
         )
-    c1, c2, c3 = st.columns(3)
+    closed = [r for r in rows if not _alert_is_open(r)]
+    wins = sum(1 for r in closed if r.get("outcome") == "WIN")
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Alerts", len(rows))
-    c2.metric("Pushed", sum(1 for r in rows if r["delivered"]))
-    c3.metric("Failed", len(failed))
+    c2.metric("Open", len(rows) - len(closed))
+    c3.metric("Closed", len(closed),
+              delta=f"{wins}W / {len(closed) - wins}L" if closed else None,
+              delta_color="off")
+    c4.metric("Pushed", sum(1 for r in rows if r["delivered"]))
+    c5.metric("Failed", len(failed))
 
     df = pd.DataFrame(rows)
     df["When"] = pd.to_datetime(df["created_at"], errors="coerce", utc=True).dt.tz_convert("America/New_York")
     df["Side"] = df["direction"].map(lambda d: "LONG" if d and d > 0 else "SHORT")
     df["Signal"] = df["signal"].map(_signal_badge)
+    df["Status"] = [_alert_status_label(r) for r in rows]
     df["Push"] = [
         "✅ " + (r["channel"] or "") if r["delivered"]
         else (f"❌ {r['delivery_error']}" if r["delivery_error"] else "— not pushed")
@@ -576,10 +592,11 @@ def _render_alerts_tab(storage: Storage) -> None:
         for cur, e, d in zip(df["Current"], df["entry"], df["direction"])
     ]
     view = df[[
-        "When", "ticker", "Side", "Signal", "entry", "stop", "target", "Current",
-        "Move %", "rr_ratio", "total_score", "Push", "source", "reason",
+        "When", "ticker", "Status", "Side", "Signal", "entry", "stop", "target", "Current",
+        "Move %", "exit_price", "r_multiple", "rr_ratio", "total_score", "Push", "source", "reason",
     ]].rename(columns={
         "ticker": "Ticker", "entry": "Entry", "stop": "Stop", "target": "Target",
+        "exit_price": "Exit", "r_multiple": "Result R",
         "rr_ratio": "R:R", "total_score": "Score", "source": "Source", "reason": "Reason",
     })
     st.dataframe(
@@ -597,10 +614,43 @@ def _render_alerts_tab(storage: Storage) -> None:
                 format="%+.2f%%",
                 help="Change from Entry in the alert's favor — positive = working, negative = against",
             ),
+            "Exit": st.column_config.NumberColumn(
+                format="%.2f", help="Price the tracked trade closed at (blank while open)",
+            ),
+            "Result R": st.column_config.NumberColumn(
+                format="%+.2f", help="Net R multiple of the closed trade, after estimated costs",
+            ),
             "R:R": st.column_config.NumberColumn(format="%.1f"),
             "Score": st.column_config.NumberColumn(format="%.0f"),
+            "Status": st.column_config.TextColumn(
+                help="Open = stop and target not yet hit. Closed = resolved by the "
+                     "forward tracker: target hit, stop hit, or timed out after the max hold",
+            ),
         },
     )
+
+
+def _alert_is_open(row: dict) -> bool:
+    """An alert stays open until its tracked signal resolves."""
+    return row.get("trade_status") == "open"
+
+
+_EXIT_LABELS = {"TARGET": "target hit", "STOP": "stop hit", "TIMEOUT": "timed out"}
+
+
+def _alert_status_label(row: dict) -> str:
+    if _alert_is_open(row):
+        return "🟢 Open"
+    outcome = row.get("outcome")
+    reason = _EXIT_LABELS.get(row.get("exit_reason") or "", "")
+    suffix = f" — {reason}" if reason else ""
+    if outcome == "WIN":
+        return f"✅ Closed · Win{suffix}"
+    if outcome == "LOSS":
+        return f"❌ Closed · Loss{suffix}"
+    if outcome == "BREAKEVEN":
+        return f"➖ Closed · Breakeven{suffix}"
+    return "⚪ Closed"
 
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────

@@ -993,13 +993,26 @@ class Storage:
             )
 
     def load_alerts(self, limit: int = 200, since_minutes: Optional[int] = None) -> list:
-        """Most recent alerts first. ``since_minutes`` restricts to a recent window."""
-        sql = "SELECT * FROM stock_alerts"
+        """Most recent alerts first. ``since_minutes`` restricts to a recent window.
+
+        Each row carries the lifecycle of the trade it announced: ``trade_status``
+        ('open' | 'closed', None if the tracked signal is gone) and, once closed,
+        the outcome, exit reason, exit price and net R from stock_trade_outcomes.
+        """
+        sql = (
+            "SELECT a.*, t.status AS trade_status, o.outcome, o.exit_reason, "
+            "       o.exit_price, o.r_multiple, o.exit_ts "
+            "FROM stock_alerts a "
+            "LEFT JOIN stock_signal_tracking t ON t.id = a.tracking_id "
+            "LEFT JOIN stock_trade_outcomes o ON o.id = ("
+            "  SELECT MAX(id) FROM stock_trade_outcomes WHERE tracking_id = a.tracking_id"
+            ")"
+        )
         params: list = []
         if since_minutes is not None:
-            sql += " WHERE created_at >= datetime('now', ?)"
+            sql += " WHERE a.created_at >= datetime('now', ?)"
             params.append(f"-{int(since_minutes)} minutes")
-        sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        sql += " ORDER BY a.created_at DESC, a.id DESC LIMIT ?"
         params.append(limit)
         with self._connect() as conn:
             return [dict(r) for r in conn.execute(sql, params).fetchall()]
