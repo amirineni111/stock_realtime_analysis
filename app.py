@@ -18,6 +18,7 @@ from stocks.tickers import parse_watchlist
 from stocks.scanner import run_scan
 from stocks.storage import Storage
 from stocks.training import evaluate_and_fit, gate_summary, save_candidate
+from stocks.tradingview import DISPLAY_REGEX, tradingview_url
 
 st.set_page_config(
     page_title="Stock Screening Dashboard",
@@ -87,6 +88,19 @@ SIGNAL_COLORS = {
 
 def _signal_badge(signal: str) -> str:
     return f"{SIGNAL_COLORS.get(signal, '⚫')} {signal}"
+
+
+def _tv_link_column(label: str = "Ticker"):
+    """Ticker column rendered as a TradingView chart link (opens in a new tab).
+    Pair with ``_tv_links`` on the column's values."""
+    return st.column_config.LinkColumn(
+        label, display_text=DISPLAY_REGEX,
+        help="Click to open the chart in TradingView",
+    )
+
+
+def _tv_links(col: pd.Series) -> pd.Series:
+    return col.map(lambda t: tradingview_url(t) if isinstance(t, str) and t else t)
 
 
 # ── Market index header strip ────────────────────────────────────────────────
@@ -402,14 +416,16 @@ def _render_paper_tab(storage: Storage) -> None:
                 return ["background-color: #f3d8d8; color: #000000"] * len(row)
             return [""] * len(row)
 
+        pos_view = pos_df.assign(ticker=_tv_links(pos_df["ticker"]))
         st.dataframe(
-            pos_df.style.apply(_pnl_row, axis=1).format({
+            pos_view.style.apply(_pnl_row, axis=1).format({
                 "avg_entry": "{:,.2f}", "mark": "{:,.2f}", "stop": "{:,.2f}",
                 "target": "{:,.2f}", "open_pnl": "{:+,.2f}", "pnl_pct": "{:+.2f}%",
                 "R": "{:+.2f}", "realized": "{:+,.2f}", "qty": "{:,.0f}",
             }, na_rep="—"),
             use_container_width=True,
             hide_index=True,
+            column_config={"ticker": _tv_link_column()},
         )
         st.caption(
             "Marks are live 1-minute prices (30s cache). Positions close only when "
@@ -438,9 +454,11 @@ def _render_paper_tab(storage: Storage) -> None:
         c2.metric("Wins / Losses", f"{wins} / {losses}")
         c3.metric("Win rate", f"{wins / len(cdf) * 100:.1f}%" if len(cdf) else "—")
         st.dataframe(
-            cdf.style.format({"avg_entry": "{:,.2f}", "realized": "{:+,.2f}"}, na_rep="—"),
+            cdf.assign(ticker=_tv_links(cdf["ticker"])).style.format(
+                {"avg_entry": "{:,.2f}", "realized": "{:+,.2f}"}, na_rep="—"),
             use_container_width=True,
             hide_index=True,
+            column_config={"ticker": _tv_link_column()},
         )
 
     with st.expander("Fill History"):
@@ -599,9 +617,11 @@ def _render_alerts_tab(storage: Storage) -> None:
         "exit_price": "Exit", "r_multiple": "Result R",
         "rr_ratio": "R:R", "total_score": "Score", "source": "Source", "reason": "Reason",
     })
+    view["Ticker"] = _tv_links(view["Ticker"])
     st.dataframe(
         view, use_container_width=True, hide_index=True,
         column_config={
+            "Ticker": _tv_link_column(),
             "When": st.column_config.DatetimeColumn("When (ET)", format="MMM DD HH:mm"),
             "Entry": st.column_config.NumberColumn(format="%.2f"),
             "Stop": st.column_config.NumberColumn(format="%.2f"),
@@ -996,12 +1016,16 @@ def _page_scanner(
                     return ["background-color: #fff3b0; color: #000000"] * len(row)
                 return [""] * len(row)
 
-            styled = display.style.format(fmt_map, na_rep="").apply(_style_row, axis=1)
+            # Link a copy: `display` itself feeds the CSV export, which keeps plain tickers.
+            grid = (display.assign(ticker=_tv_links(display["ticker"]))
+                    if "ticker" in display.columns else display)
+            styled = grid.style.format(fmt_map, na_rep="").apply(_style_row, axis=1)
 
             event = st.dataframe(
                 styled,
                 use_container_width=True,
                 hide_index=True,
+                column_config={"ticker": _tv_link_column()},
                 on_select="rerun",
                 selection_mode="single-row",
                 key="results_grid",
@@ -1626,10 +1650,13 @@ def _page_live_quotes(storage: Storage, selected_tickers: list, allow_offhours: 
             fmt["change_pct"] = "{:+.2f}%"
         if "volume" in display.columns:
             fmt["volume"] = "{:,.0f}"
+        if "ticker" in display.columns:
+            display = display.assign(ticker=_tv_links(display["ticker"]))
         st.dataframe(
             display.style.apply(_row_color, axis=1).format(fmt, na_rep=""),
             use_container_width=True,
             hide_index=True,
+            column_config={"ticker": _tv_link_column()},
             on_select="rerun",
             selection_mode="single-row",
             key="quotes_grid",

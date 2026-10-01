@@ -435,6 +435,11 @@ def run_scan(
         and mins_open is not None
         and mins_open < OPEN_CHOP_MINUTES
     )
+    # Regular-session gate: outside 09:30-16:00 ET the latest bar is stale (e.g. the
+    # 15:55 bar re-scored by an evening dashboard refresh) and the entry can't be
+    # taken at that price. The headless runner already skips these scans; this
+    # stops the dashboard from arming, tracking and pushing them.
+    market_open = phase == "REGULAR"
     for s in snapshots:
         ticker_bars = bars_by_ticker.get(s.ticker) or []
         if ticker_bars:
@@ -457,6 +462,7 @@ def run_scan(
             and ticker_bars
             and not thin_edge
             and not opening_chop
+            and market_open
         ):
             direction = -1 if "SHORT" in s.trade_signal else 1
             try:

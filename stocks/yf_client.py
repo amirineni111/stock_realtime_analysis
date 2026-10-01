@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 import threading
 import time as _time
 from datetime import datetime, timedelta, timezone
@@ -6,6 +7,7 @@ from typing import Dict, List, Optional, Sequence
 
 import pandas as pd
 import yfinance as yf
+from yfinance import shared as yf_shared
 from zoneinfo import ZoneInfo
 
 from .models import StockBar, StockQuote
@@ -29,6 +31,15 @@ _INTERVAL_DELTA = {
 # Higher timeframes change slowly — cache them so steady-state auto-refresh costs
 # a single 5m request per scan instead of three.
 _CACHE_TTL_SECONDS = {"1h": 600.0, "1d": 1800.0}
+
+# yf.download keeps per-call results in module-level globals (yfinance.shared._DFS),
+# reset at the start of every call. Concurrent calls from different YFClient
+# instances (scanner, indices, paper, quotes page) clobber each other and tickers
+# fail with "'NoneType' object is not subscriptable" — so serialize them process-wide.
+_DOWNLOAD_LOCK = threading.Lock()
+# Per-request timeout (seconds). yfinance's default of 10s is tight when a batch
+# fires ~20 requests at once.
+_DOWNLOAD_TIMEOUT = 20
 
 
 class DataFetchError(RuntimeError):
@@ -99,27 +110,72 @@ def _slice_ticker(df: pd.DataFrame, ticker: str) -> Optional[pd.DataFrame]:
     return df
 
 
+def _merge_retry(
+    df: pd.DataFrame, df_retry: Optional[pd.DataFrame], retry: List[str]
+) -> pd.DataFrame:
+    """Replace the failed tickers' (empty) columns in a batched frame with the
+    retried data. Leaves ``df`` as-is when the retry produced nothing."""
+    if df_retry is None or df_retry.empty:
+        return df
+    if not isinstance(df_retry.columns, pd.MultiIndex):
+        df_retry = pd.concat({retry[0]: df_retry}, axis=1)
+    if not isinstance(df.columns, pd.MultiIndex):
+        return df_retry if df.empty else df
+    got = set(df_retry.columns.get_level_values(0))
+    keep = df.loc[:, ~df.columns.get_level_values(0).isin(got)]
+    return pd.concat([keep, df_retry], axis=1).sort_index()
+
+
 class YFClient:
     def __init__(self) -> None:
         self._cache: dict = {}  # interval -> (monotonic_ts, tickers_set, {ticker: [StockBar]})
         self._lock = threading.Lock()
 
+    @staticmethod
+    def _download_locked(tickers: List[str], interval: str, quiet: bool) -> tuple:
+        """One yf.download under the process-wide lock. Returns (frame, failed
+        tickers). ``quiet`` mutes yfinance's own "N Failed downloads" log line."""
+        yf_logger = logging.getLogger("yfinance")
+        with _DOWNLOAD_LOCK:
+            prev_level = yf_logger.level
+            if quiet:
+                yf_logger.setLevel(logging.CRITICAL)
+            try:
+                df = yf.download(
+                    tickers=tickers,
+                    interval=interval,
+                    period=INTERVAL_PERIOD[interval],
+                    group_by="ticker",
+                    auto_adjust=False,
+                    prepost=False,
+                    progress=False,
+                    threads=True,
+                    timeout=_DOWNLOAD_TIMEOUT,
+                )
+                failed = set(getattr(yf_shared, "_ERRORS", {}) or {})
+            finally:
+                yf_logger.setLevel(prev_level)
+        return df, failed
+
     def _download(self, tickers: Sequence[str], interval: str) -> pd.DataFrame:
+        tickers = list(tickers)
         try:
-            df = yf.download(
-                tickers=list(tickers),
-                interval=interval,
-                period=INTERVAL_PERIOD[interval],
-                group_by="ticker",
-                auto_adjust=False,
-                prepost=False,
-                progress=False,
-                threads=True,
-            )
+            df, failed = self._download_locked(tickers, interval, quiet=True)
         except Exception as exc:
             raise DataFetchError(f"yfinance download failed ({interval}): {exc}") from exc
         if df is None:
             raise DataFetchError(f"yfinance returned no data ({interval})")
+
+        # A transient Yahoo timeout/reset surfaces per ticker as
+        # TypeError("'NoneType' object is not subscriptable") (yfinance swallows the
+        # network error, then indexes the None response). Retry those once.
+        retry = [t for t in tickers if t.upper() in failed]
+        if retry:
+            try:
+                df_retry, _ = self._download_locked(retry, interval, quiet=False)
+            except Exception:
+                df_retry = None
+            df = _merge_retry(df, df_retry, retry)
         return df
 
     def get_bars(self, tickers: Sequence[str], interval: str) -> Dict[str, List[StockBar]]:

@@ -278,3 +278,22 @@ class TestModelVeto:
         run_scan(settings, storage, request)
         snap = next(s for s in storage.load_latest_snapshots() if s["ticker"] == "AAPL")
         assert snap["model_prob"] is None, "a mismatched model must not be served"
+
+
+class TestRegularSessionGate:
+    def test_regular_session_arms(self, env):
+        summary, storage, snap = _run(env)
+        if snap["trade_signal"] not in ("STRONG_BUY", "BUY_CANDIDATE",
+                                        "STRONG_SHORT", "SHORT_CANDIDATE"):
+            pytest.skip(f"synthetic series scored {snap['trade_signal']}, nothing armed")
+        assert summary.armed
+        assert storage.load_tracked_signals("open")
+
+    @pytest.mark.parametrize("phase", ["AFTER_HOURS", "CLOSED", "PRE_MARKET"])
+    def test_off_hours_scan_arms_nothing(self, env, monkeypatch, phase):
+        """An evening dashboard refresh re-scores the stale 15:55 bar; it must not
+        arm, track or push it (the 2026-09-30 20:27 ET BROS/TXN alerts)."""
+        monkeypatch.setattr(scanner_mod, "current_market_phase", lambda now=None: phase)
+        summary, storage, _ = _run(env)
+        assert summary.armed == []
+        assert storage.load_tracked_signals("open") == []
